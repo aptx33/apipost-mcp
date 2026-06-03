@@ -44,7 +44,10 @@ function checkSecurityPermission(operation) {
 }
 // URL前缀处理
 function applyUrlPrefix(url) {
-    if (!url || !APIPOST_URL_PREFIX) return url;
+    if (!url) return url;
+    // 将 OpenAPI 风格 {变量名} 转为 ApiPost 风格 :变量名
+    url = url.replace(/\{(\w+)\}/g, ':$1');
+    if (!APIPOST_URL_PREFIX) return url;
     // 如果url已经包含了前缀，则不重复添加
     if (url.startsWith(APIPOST_URL_PREFIX)) return url;
     // 确保拼接时斜杠正确处理
@@ -712,6 +715,10 @@ function buildApiConfig(args) {
         ensureFieldsHaveDesc(config.cookies, 'cookies');
         providedFields.add('cookies');
     }
+    if (args.restful !== undefined) {
+        config.restful = parseConfigParam(args.restful);
+        providedFields.add('restful');
+    }
     if (args.auth !== undefined) {
         config.auth = parseApiConfig(args.auth);
         providedFields.add('auth');
@@ -894,6 +901,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     query: { type: 'string', description: 'Query字段列表字符串，格式同上。嵌套用 .，数组用 []（如 meta.flags.debug 或 items[].id）。' },
                     body: { type: 'string', description: 'Body字段列表字符串，仅用字段列表生成 raw/参数描述，example 用真实值，不要放 JSON 字符串。' },
                     cookies: { type: 'string', description: 'Cookies字段列表字符串，格式同上。' },
+                    restful: { type: 'string', description: 'RESTful路径参数字段列表字符串。URL中用 :变量名 表示路径参数，此处定义参数描述。格式：[{"key":"id","desc":"用户ID","type":"string","required":true,"example":"12345"}]' },
                     auth: { type: 'string', description: '认证配置JSON字符串（可选）。格式：{"type":"bearer","bearer":{"key":"your_token"}}' },
                     responses: { type: 'string', description: '响应字段列表字符串（必填 fields），格式：[{"name":"成功","status":200,"fields":[{"key":"code","type":"integer","example":0,"desc":"状态码"},{"key":"data.items[].id","type":"string","example":"1"}]}]' }
                 },
@@ -935,6 +943,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     query: { type: 'string', description: 'Query参数JSON数组字符串（可选）。提供"[]"可删除所有query参数。格式：[{"key":"page","desc":"页码","type":"integer","required":false,"example":"1"}]' },
                     body: { type: 'string', description: 'Body参数JSON数组字符串（可选）。提供"[]"可删除所有body参数。格式：[{"key":"name","desc":"用户名","type":"string","required":true,"example":"张三"}]' },
                     cookies: { type: 'string', description: 'Cookies参数JSON数组字符串（可选）。提供"[]"可删除所有cookies。格式：[{"key":"session_id","desc":"会话ID","type":"string","required":false,"example":"abc123"}]' },
+                    restful: { type: 'string', description: 'RESTful路径参数JSON数组字符串（可选）。URL中用 :变量名 表示路径参数。格式：[{"key":"id","desc":"用户ID","type":"string","required":true,"example":"12345"}]' },
                     auth: { type: 'string', description: '认证配置JSON字符串（可选）。提供"{}"可删除认证配置。格式：{"type":"bearer","bearer":{"key":"your_token"}}' },
                     responses: { type: 'string', description: '响应示例JSON数组字符串（可选）。提供"[]"可删除所有响应示例。格式：[{"name":"成功响应","status":200,"data":{"code":0},"fields":[{"key":"code","desc":"状态码","type":"integer","example":"0"}]}]' }
                 },
@@ -1542,7 +1551,11 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                             ? convertParams(newConfig.cookies || [])
                             : (originalApi.request?.cookie?.parameter || [])
                     },
-                    restful: originalApi.request?.restful || { parameter: [] }
+                    restful: {
+                        parameter: providedFields.has('restful')
+                            ? convertParams(newConfig.restful || [])
+                            : (originalApi.request?.restful?.parameter || [])
+                    }
                 };
                 const responseSection = providedFields.has('responses')
                     ? normalizeResponses(newConfig.responses, {
@@ -1696,6 +1709,21 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 }
                 else {
                     detailText += `   (无Cookies参数)\n`;
+                }
+                detailText += `\n`;
+                // Restful路径参数
+                const restfulParams = apiDetail.request?.restful?.parameter || [];
+                detailText += `🔗 路径参数 (${restfulParams.length}个)\n`;
+                if (restfulParams.length > 0) {
+                    restfulParams.forEach((param: any, index: number) => {
+                        detailText += `   ${index + 1}. ${param.key}: ${param.description || '无描述'}\n`;
+                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${param.not_null ? '是' : '否'}\n`;
+                        if (param.value)
+                            detailText += `      示例: ${param.value}\n`;
+                    });
+                }
+                else {
+                    detailText += `   (无路径参数)\n`;
                 }
                 detailText += `\n`;
                 // 认证配置

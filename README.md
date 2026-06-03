@@ -230,3 +230,23 @@ apipost_create_folder name: "认证接口" parent_id: "folder_123" description: 
 
 
 ⭐ 如果这个项目对你有帮助，请给我们一个星标！
+
+---
+
+## Fork 修改说明
+
+本仓库 fork 自 [jlcodes99/apipost-mcp](https://github.com/jlcodes99/apipost-mcp)，在原项目基础上增加了以下功能：
+
+### 1. 新增 RESTful 路径参数（restful）支持
+
+- `apipost_smart_create` 和 `apipost_update` 两个工具新增 `restful` 参数，支持定义 URL 中的路径变量（如 `:id`、`:userId`）
+- 格式与其他参数字段保持一致：`[{"key":"id","desc":"用户ID","type":"string","required":true,"example":"12345"}]`
+
+### 2. URL 路径变量自动转换
+
+- 自动将 OpenAPI 风格的 `{变量名}` 转换为 ApiPost 要求的 `:变量名` 格式
+- 无论是否配置 `APIPOST_URL_PREFIX`，转换均会生效
+
+### 3. apipost_detail 增加路径参数展示
+
+- 查看接口详情时，输出中增加"路径参数"区域，展示已定义的 RESTful 路径变量及其描述、类型、示例值
