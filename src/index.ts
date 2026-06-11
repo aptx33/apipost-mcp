@@ -327,9 +327,19 @@ function normalizeResponses(responses, options = {}) {
     const converted = responses.map((resp, index) => ({
         example_id: String(index + 1),
         raw: (() => {
+            // 如果提供了 data 字段，直接作为响应示例（支持完整多对象数组）
+            if (resp.data) {
+                const dataStr = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 4);
+                try {
+                    const parsed = JSON.parse(dataStr);
+                    return JSON.stringify(parsed, null, 4);
+                } catch {
+                    return dataStr;
+                }
+            }
             const fields = Array.isArray(resp.fields) ? resp.fields : [];
             if (fields.length === 0) {
-                throw new Error('responses.fields 必填且不能为空，data 字段已禁用，请提供字段列表');
+                throw new Error('responses.fields 必填且不能为空，请提供字段列表或 data 字段');
             }
             const expandedFields = expandFieldListWithParents(fields);
             const descMap = buildDescMap(expandedFields);
