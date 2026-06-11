@@ -265,6 +265,61 @@ function buildBodySection(bodyParams) {
         binary: null
     };
 }
+// 从 fields 列表生成 JSON Schema（用于预定义响应期望的数据结构）
+function buildSchemaFromFields(fields) {
+    if (!Array.isArray(fields) || fields.length === 0) {
+        return { type: 'object', properties: {} };
+    }
+    const expanded = expandFieldListWithParents(fields);
+    const root: any = { type: 'object', properties: {}, description: '响应体' };
+
+    expanded.forEach(field => {
+        if (!field || !field.key) return;
+        const path = String(field.key);
+        const segments = path.split('.');
+        let current = root;
+
+        segments.forEach((seg, idx) => {
+            const isLeaf = idx === segments.length - 1;
+            const isArrayItem = seg.endsWith('[]');
+            const cleanKey = isArrayItem ? seg.slice(0, -2) : seg;
+
+            if (isArrayItem) {
+                if (!current.properties) current.properties = {};
+                if (!current.properties[cleanKey]) {
+                    current.properties[cleanKey] = { type: 'array', items: { type: 'object', properties: {} } };
+                } else if (!current.properties[cleanKey].items) {
+                    current.properties[cleanKey].items = { type: 'object', properties: {} };
+                }
+                if (field.desc && isLeaf) {
+                    current.properties[cleanKey].items.description = field.desc;
+                }
+                if (!isLeaf) {
+                    current = current.properties[cleanKey].items;
+                }
+            } else if (isLeaf) {
+                if (!current.properties) current.properties = {};
+                const schemaType = (field.type || 'string').toLowerCase();
+                const node: any = { type: schemaType };
+                if (field.desc) node.description = field.desc;
+                if (schemaType === 'array') {
+                    node.items = { type: 'object', properties: {} };
+                }
+                current.properties[cleanKey] = node;
+            } else {
+                if (!current.properties) current.properties = {};
+                if (!current.properties[cleanKey]) {
+                    current.properties[cleanKey] = { type: 'object', properties: {} };
+                }
+                if (field.desc && !current.properties[cleanKey].description) {
+                    current.properties[cleanKey].description = field.desc;
+                }
+                current = current.properties[cleanKey];
+            }
+        });
+    });
+    return root;
+}
 // 统一响应数据转换
 function generateResponseData(responseConfig) {
     if (!responseConfig)
@@ -348,15 +403,21 @@ function normalizeResponses(responses, options = {}) {
                 ? stringifyWithComments(rawData, descMap)
                 : JSON.stringify(rawData, null, 4);
         })(),
-        raw_parameter: convertParams(expandFieldListWithParents(resp.fields || [])),
+        raw_parameter: [],
         headers: [],
         expect: {
             code: String(resp.status ?? 200),
             content_type: 'application/json',
             is_default: index === 0 ? 1 : -1,
-            mock: JSON.stringify(buildJsonFromFieldList(expandFieldListWithParents(resp.fields || []))),
+            mock: (() => {
+                if (resp.data) {
+                    const dataStr = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
+                    try { return JSON.stringify(JSON.parse(dataStr)); } catch { return dataStr; }
+                }
+                return JSON.stringify(buildJsonFromFieldList(expandFieldListWithParents(resp.fields || [])));
+            })(),
             name: resp.name || (index === 0 ? '成功响应' : `响应${index + 1}`),
-            schema: resp.schema || { type: 'object', properties: {} },
+            schema: resp.schema || buildSchemaFromFields(resp.fields || []),
             verify_type: 'schema',
             sleep: 0
         }
