@@ -5,9 +5,11 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { runBenchmark } from '../scripts/benchmark-sync.mjs';
+import { contractDifferences } from '../dist/sync-batch.js';
 
 // MCP 子进程仅连接本机模拟服务器，不读取任何个人配置或真实凭据。
-async function fixture(t, securityMode = 'limited') {
+async function fixture(t, securityMode = 'limited', hooks = {}) {
     const documents = new Map();
     const requests = [];
     const mock = createServer(async (req, res) => {
@@ -20,18 +22,32 @@ async function fixture(t, securityMode = 'limited') {
         else if (req.url.startsWith('/open/project/list')) data = [{ project_id: 'project', name: 'mock-project' }];
         else if (req.url === '/open/apis/create' || req.url === '/open/apis/update') {
             const doc = structuredClone(body);
+            const behavior = hooks.write?.(doc, req.url);
+            if (behavior === 'reject') {
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ code: 1, msg: '模拟明确拒绝' }));
+                return;
+            }
+            if (behavior === 'disconnect-before') { req.socket.destroy(); return; }
             // 模拟服务端规范化，验证客户端没有依赖本地推算的版本或参数值类型。
             doc.version = 1000 + requests.length;
-            for (const group of [doc.request.header.parameter, doc.request.query.parameter, doc.request.body.raw_parameter]) {
+            for (const group of [doc.request?.header?.parameter || [], doc.request?.query?.parameter || [], doc.request?.body?.raw_parameter || []]) {
                 for (const field of group) {
                     if (field.not_null === 0) field.not_null = 1;
                     field.value = typeof field.value === 'string' ? field.value : JSON.stringify(field.value);
                 }
             }
             documents.set(doc.target_id, doc);
+            hooks.corrupt?.(doc);
+            if (behavior === 'disconnect-after') { req.socket.destroy(); return; }
             data = { target_id: doc.target_id };
         } else if (req.url === '/open/apis/details') {
             data = { list: body.target_ids.filter(id => documents.has(id)).map(id => documents.get(id)).reverse() };
+        } else if (req.url.startsWith('/open/apis/list')) {
+            data = { list: [...documents.values()].filter(doc => doc.status !== -1) };
+        } else if (req.url === '/open/apis/delete') {
+            for (const id of body.target_ids) if (documents.has(id)) documents.get(id).status = -1;
+            data = {};
         } else {
             res.writeHead(404).end();
             return;
@@ -185,6 +201,7 @@ test('只读安全模式允许批量读取，拒绝所有写入', async t => {
     for (const [name, args] of [
         ['apipost_smart_create', { method: 'GET', name: '不应创建', url: '/never' }],
         ['apipost_update', { target_id: 'never', description: '不应修改' }],
+        ['apipost_sync_batch', { items: [batchItem('never')] }],
         ['apipost_delete', { api_ids: ['never'] }]
     ]) {
         assert.equal((await f.call(name, args)).isError, true);
@@ -223,4 +240,132 @@ test('显式 null 和原生响应保真，非法载荷不写入', async t => {
     assert.ok(!result.isError);
     assert.equal(f.documents.get(id).request.body.mode, 'none');
     assert.deepEqual(f.documents.get(id).response.example, []);
+});
+
+const batchItem = (key, extra = {}) => ({ key, action: 'create', name: '完整批量示例', method: 'POST',
+    url: `http://localhost/epm/batch/${key}`, body: JSON.stringify(bodyFields), bodyRaw: rawRequest,
+    responses: JSON.stringify(responses), ...extra });
+const parseResult = result => {
+    assert.ok(!result.isError, result.content[0].text);
+    return JSON.parse(result.content[0].text);
+};
+
+test('结构化创建和列表不解析文案，删除以有效列表验收', async t => {
+    const f = await fixture(t, 'full');
+    const folder = parseResult(await f.call('apipost_create_folder', { name: '搜索条件也包含名字', format: 'json' }));
+    assert.ok(f.documents.has(folder.target_id));
+    const created = parseResult(await f.call('apipost_smart_create', { method: 'GET', url: '/structured', name: '结构化接口', parent_id: folder.target_id, format: 'json' }));
+    const list = parseResult(await f.call('apipost_list', { search: '不存在的关键词', format: 'json' }));
+    assert.equal(list.matched_count, 0);
+    assert.deepEqual(list.items, []);
+    const folderList = parseResult(await f.call('apipost_list', { parent_id: folder.target_id, format: 'json' }));
+    assert.equal(folderList.items[0].target_id, created.target_id);
+    const removed = parseResult(await f.call('apipost_delete', { api_ids: [created.target_id], format: 'json' }));
+    assert.equal(removed.request_succeeded, true);
+    assert.equal(removed.verified, true);
+    assert.equal((await f.read([created.target_id])).list[0].status, -1, '删除后详情仍保留');
+    const text = await f.call('apipost_list', {});
+    assert.match(text.content[0].text, /项目列表/);
+});
+
+test('批量预检、完整新增、重复查重、无变化和指纹冲突', async t => {
+    const f = await fixture(t);
+    let result = await f.call('apipost_sync_batch', { items: [batchItem('valid'), batchItem('invalid', { body: '{}' })] });
+    assert.equal(result.isError, true);
+    assert.equal(f.documents.size, 0, '整批本地预检失败不得部分写入');
+    const items = ['first', 'second', 'third'].map(key => batchItem(key));
+    let batch = parseResult(await f.call('apipost_sync_batch', { items }));
+    assert.equal(batch.success, true);
+    assert.deepEqual(batch.results.map(r => r.status), ['created', 'created', 'created']);
+    const ids = batch.results.map(r => r.target_id);
+    const docs = await f.read(ids);
+    for (const doc of docs.list) {
+        assert.equal(doc.request.body.raw, rawRequest);
+        assert.deepEqual(JSON.parse(doc.response.example[0].raw), responseData);
+        assert.equal(doc.request.body.raw_parameter[1].not_null, -1);
+    }
+    batch = parseResult(await f.call('apipost_sync_batch', { items }));
+    assert.deepEqual(batch.results.map(r => r.status), ['conflict', 'conflict', 'conflict']);
+    assert.equal(f.documents.size, 3);
+    const update = { ...items[0], action: 'update', target_id: ids[0], expected_fingerprint: docs.fingerprints[ids[0]] };
+    let writes = f.requests.filter(r => r.path === '/open/apis/update').length;
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [update] }));
+    assert.equal(batch.results[0].status, 'unchanged');
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/update').length, writes);
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [{ ...update, description: '新的字段契约说明' }] }));
+    assert.equal(batch.results[0].status, 'updated');
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [{ ...update, description: '过期覆盖' }] }));
+    assert.equal(batch.results[0].status, 'conflict');
+    assert.equal(f.documents.get(ids[0]).description, '新的字段契约说明');
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [batchItem('duplicate-a', { url: '/same/{id}/' }), batchItem('duplicate-b', { url: '/same/:id?x=1' })] }));
+    assert.deepEqual(batch.results.map(r => r.status), ['conflict', 'conflict']);
+    const deletes = f.requests.filter(r => r.path === '/open/apis/delete').length;
+    assert.equal((await f.call('apipost_delete', { api_ids: ids, format: 'json' })).isError, true);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/delete').length, deletes, 'limited 模式不能越权清理');
+});
+
+test('明确失败继续，网络结果不明停止且不重试', async t => {
+    const f = await fixture(t, 'limited', { write: doc => doc.url.endsWith('/reject') ? 'reject'
+        : doc.url.endsWith('/unknown') ? 'disconnect-after' : undefined });
+    const batch = parseResult(await f.call('apipost_sync_batch', { items: ['reject', 'accepted', 'unknown', 'never'].map(key => batchItem(key)) }));
+    assert.deepEqual(batch.results.map(r => r.status), ['failed', 'created', 'created', 'unverified']);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/create').length, 3);
+    assert.equal(f.documents.size, 2);
+    assert.match(batch.results[3].error, /未尝试/);
+});
+
+test('验收发现截断、null或布尔变化及字段说明丢失', async t => {
+    const f = await fixture(t, 'limited', { corrupt: doc => {
+        if (doc.target_type !== 'api') return;
+        const raw = JSON.parse(doc.request.body.raw); raw.unanswered = ''; raw.medication = true;
+        doc.request.body.raw = JSON.stringify(raw);
+        doc.request.body.raw_parameter[0].description = '';
+        const response = doc.response.example[0];
+        const data = JSON.parse(response.raw); data.message.rows.length = 1;
+        response.raw = JSON.stringify(data);
+    } });
+    const batch = parseResult(await f.call('apipost_sync_batch', { items: [batchItem('corrupt')] }));
+    assert.equal(batch.success, false);
+    assert.equal(batch.results[0].status, 'unverified');
+    assert.ok(batch.results[0].differences.includes('request.body.raw'));
+    assert.ok(batch.results[0].differences.includes('request.body.uuid.description'));
+    assert.ok(batch.results[0].differences.includes('response[0].raw'));
+    const actual = structuredClone([...f.documents.values()][0]), expected = structuredClone(actual);
+    expected.response.example[0].raw = '"OK"'; actual.response.example[0].raw = 'OK';
+    assert.ok(contractDifferences(actual, expected, { action: 'update', responses: '[]' }).includes('response[0].raw'), '无效JSON不能与合法JSON字符串判为相等');
+});
+
+test('测速成功及局部失败均仅清理本批对象，原接口保持不变', async t => {
+    for (const fail of [false, true]) {
+        const f = await fixture(t, 'full', { write: doc => fail && doc.url?.includes('__apipost_benchmark') && doc.url.endsWith('/1') ? 'reject' : undefined });
+        const ids = [];
+        for (let i = 0; i < 3; i++) ids.push(await create(f, { url: `/source/${i}` }));
+        const original = await f.read(ids);
+        const result = await runBenchmark(f.call, ids);
+        assert.equal(result.success, !fail);
+        assert.equal(result.cleanupComplete, true);
+        assert.equal(result.originalsUnchanged, true);
+        assert.equal([...f.documents.values()].filter(doc => doc.status !== -1).length, 3);
+        assert.deepEqual((await f.read(ids)).fingerprints, original.fingerprints);
+    }
+});
+
+test('测速目录出现外部对象时不级联删除，报告遗留目标', async t => {
+    const f = await fixture(t, 'full');
+    const id = await create(f);
+    const invoke = async (name, args) => {
+        const response = await f.call(name, args);
+        if (name === 'apipost_create_folder' && !response.isError) {
+            const folder = JSON.parse(response.content[0].text).target_id;
+            f.documents.set('foreign', { target_id: 'foreign', target_type: 'api', parent_id: folder, name: '外部对象', url: '/foreign', method: 'GET', status: 1 });
+        }
+        return response;
+    };
+    const result = await runBenchmark(invoke, [id]);
+    assert.equal(result.success, false);
+    assert.equal(result.cleanupComplete, false);
+    assert.ok(result.remainingIds.includes('foreign'));
+    assert.ok(result.remainingIds.includes(result.folderId));
+    assert.equal(f.documents.get('foreign').status, 1);
+    assert.notEqual(f.documents.get(result.folderId).status, -1);
 });

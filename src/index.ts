@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import { createHash } from 'node:crypto';
+import { syncBatch } from './sync-batch.js';
 // 环境变量验证
 const APIPOST_TOKEN = process.env.APIPOST_TOKEN;
 if (!APIPOST_TOKEN) {
@@ -744,14 +745,14 @@ function buildGroupedList(items, allItems, pathMap) {
 }
 // 解析API配置
 function parseApiConfig(configJson) {
-    if (!configJson)
-        return {};
     try {
-        return JSON.parse(configJson);
+        if (typeof configJson !== 'string') throw new Error('配置必须为 JSON 字符串');
+        const value = JSON.parse(configJson);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置必须为对象');
+        return value;
     }
     catch (error) {
-        console.error('解析API配置失败:', error);
-        return {};
+        throw new Error('配置不是合法 JSON 对象，已停止写入');
     }
 }
 // 解析单个配置参数
@@ -772,6 +773,10 @@ function ensureFieldsHaveDesc(list, context) {
     const missing = list.filter(item => item && !item.desc && !item.description);
     if (missing.length > 0) {
         throw new Error(`${context} 缺少 desc，请为每个字段填写 desc`);
+    }
+    const keys = list.map(item => item?.key);
+    if (keys.some(key => typeof key !== 'string' || !key.trim()) || new Set(keys).size !== keys.length) {
+        throw new Error(`${context} 字段路径须非空且唯一`);
     }
 }
 function ensureResponsesFieldsHaveDesc(responses) {
@@ -829,6 +834,7 @@ function buildApiConfig(args) {
     }
     if (args.restful !== undefined) {
         config.restful = parseConfigParam(args.restful);
+        ensureFieldsHaveDesc(config.restful, 'restful');
         providedFields.add('restful');
     }
     if (args.auth !== undefined) {
@@ -881,6 +887,96 @@ function generateApiTemplate(method, url, name, config = {}) {
         tags: config.tags || []
     };
 }
+function buildUpdateTemplate(args, originalApi) {
+    const targetId = args.target_id, newName = args.name, newMethod = args.method;
+    const newUrl = args.url ? applyUrlPrefix(args.url) : undefined;
+    // 构建增量更新配置对象
+    const { config: newConfig, providedFields } = buildApiConfig(args);
+    const mergedDescription = providedFields.has('description')
+        ? newConfig.description
+        : (originalApi.description || '');
+    const mergedRequest = {
+        ...(originalApi.request || {}),
+        auth: providedFields.has('auth') ? (newConfig.auth || { type: 'inherit' }) : (originalApi.request?.auth || { type: 'inherit' }),
+        pre_tasks: originalApi.request?.pre_tasks || [],
+        post_tasks: originalApi.request?.post_tasks || [],
+        header: {
+            ...(originalApi.request?.header || {}),
+            parameter: providedFields.has('headers')
+                ? convertParams(newConfig.headers || [])
+                : (originalApi.request?.header?.parameter || [])
+        },
+        query: {
+            ...(originalApi.request?.query || {}),
+            query_add_equal: originalApi.request?.query?.query_add_equal ?? 1,
+            parameter: providedFields.has('query')
+                ? convertParams(newConfig.query || [])
+                : (originalApi.request?.query?.parameter || [])
+        },
+        body: providedFields.has('body') || providedFields.has('bodyRaw')
+            ? {
+                ...(originalApi.request?.body || {}),
+                ...buildBodySection(
+                    newConfig.body || [],
+                    providedFields.has('bodyRaw') ? newConfig.bodyRaw
+                        : newConfig.body?.length > 0 && originalApi.request?.body?.mode === 'json'
+                            && originalApi.request.body.raw ? originalApi.request.body.raw : undefined),
+                ...(!providedFields.has('body') ? {
+                    raw_parameter: originalApi.request?.body?.raw_parameter || [],
+                    raw_schema: originalApi.request?.body?.raw_schema || { type: 'object' }
+                } : {})
+            }
+            : (originalApi.request?.body || buildBodySection([])),
+        cookie: {
+            ...(originalApi.request?.cookie || {}),
+            cookie_encode: originalApi.request?.cookie?.cookie_encode ?? 1,
+            parameter: providedFields.has('cookies')
+                ? convertParams(newConfig.cookies || [])
+                : (originalApi.request?.cookie?.parameter || [])
+        },
+        restful: {
+            ...(originalApi.request?.restful || {}),
+            parameter: providedFields.has('restful')
+                ? convertParams(newConfig.restful || [])
+                : (originalApi.request?.restful?.parameter || [])
+        }
+    };
+    const responseSection = providedFields.has('responses')
+        ? normalizeResponses(newConfig.responses, {
+            fallbackExamples: [],
+            useDefaultWhenMissing: false,
+            keepEmpty: true,
+            isCheckResult: originalApi.response?.is_check_result ?? 1
+        })
+        : {
+            ...(originalApi.response || {}),
+            example: originalApi.response?.example || [],
+            is_check_result: originalApi.response?.is_check_result ?? 1
+        };
+    const updateTemplate = {
+        project_id: currentWorkspace.projectId,
+        target_id: targetId,
+        parent_id: originalApi.parent_id || '0',
+        target_type: originalApi.target_type || 'api',
+        name: newName || originalApi.name,
+        method: newMethod || originalApi.method,
+        url: newUrl || originalApi.url,
+        protocol: originalApi.protocol || 'http/1.1',
+        description: mergedDescription,
+        version: (originalApi.version || 0) + 1,
+        mark_id: originalApi.mark_id || '1',
+        is_force: originalApi.is_force ?? -1,
+        sort: originalApi.sort ?? 0,
+        status: originalApi.status ?? 1,
+        is_deleted: originalApi.is_deleted ?? -1,
+        is_conflicted: originalApi.is_conflicted ?? -1,
+        request: mergedRequest,
+        response: responseSection,
+        attribute_info: originalApi.attribute_info || {},
+        tags: originalApi.tags || []
+    };
+    return updateTemplate;
+}
 function canonicalize(value) {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (value && typeof value === 'object') {
@@ -903,6 +999,31 @@ function detailJsonResult(apis, targetIds) {
         fingerprints: Object.fromEntries(list.map(api => [api.target_id, documentFingerprint(api)])),
         missing_ids: targetIds.filter(id => !byId.has(id))
     };
+}
+function jsonResult(data) { return { content: [{ type: 'text', text: JSON.stringify(data) }] }; }
+async function projectList() {
+    const response = await apiClient.get('/open/apis/list', { params: { project_id: currentWorkspace.projectId } });
+    if (response.data.code !== 0) throw new Error('获取项目列表失败');
+    return response.data.data.list;
+}
+async function completeDetails(ids) {
+    const response = await apiClient.post('/open/apis/details', { project_id: currentWorkspace.projectId, target_ids: ids });
+    if (response.data.code !== 0) throw new Error('读取完整详情失败');
+    return response.data.data.list;
+}
+function prepareBatchItem(item, original) {
+    if (item.action === 'update') return buildUpdateTemplate(item, original || {});
+    const { config } = buildApiConfig(item);
+    return { ...generateApiTemplate(item.method, item.url, item.name, config), project_id: currentWorkspace.projectId, parent_id: item.parent_id || '0' };
+}
+async function writeApi(action, template) {
+    const response = await apiClient.post(action === 'create' ? '/open/apis/create' : '/open/apis/update', template);
+    if (response.data.code !== 0) {
+        const error = new Error('服务端拒绝写入'); error.confirmedFailure = true; throw error;
+    }
+    const id = action === 'create' ? response.data.data?.target_id : template.target_id;
+    if (!id) throw new Error('未取得服务端确认的目标 ID');
+    return id;
 }
 // 工作空间信息
 let currentWorkspace = null;
@@ -1014,6 +1135,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     name: { type: 'string', description: '目录名称' },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text；json 返回服务端确认的目标 ID。' },
                     parent_id: { type: 'string', description: '父目录ID，使用"0"表示根目录，默认为"0"' },
                     description: { type: 'string', description: '目录描述（可选）' }
                 },
@@ -1028,6 +1150,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP方法' },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text；json 返回结构化创建结果。' },
                     url: { type: 'string', description: '接口URL路径' },
                     name: { type: 'string', description: '接口名称' },
                     parent_id: { type: 'string', description: '父目录ID，使用"0"表示根目录，默认为"0"' },
@@ -1052,6 +1175,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     search: { type: 'string', description: '搜索关键词（接口名称、URL、方法、ID、描述）' },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text；json 返回精确匹配数量、是否截断及对象列表，不包含大型示例。' },
                     parent_id: { type: 'string', description: '父目录ID，精确查找某个目录下的子项目。使用"0"查看根目录，使用具体ID查看子目录' },
                     target_type: { type: 'string', enum: ['api', 'folder', 'all'], description: '项目类型筛选：api(仅接口)、folder(仅目录)、all(全部)，默认all' },
                     show_structure: { type: 'boolean', description: '是否显示层级结构（树形展示），默认false为列表模式' },
@@ -1071,6 +1195,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     target_id: { type: 'string', description: '要修改的接口ID' },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text；json 返回写入结果，最终版本以完整回读为准。' },
                     expected_fingerprint: { type: 'string', description: '完整详情返回的内容指纹；与内部最新读取不一致时停止写入，防止用旧字段组覆盖新修改。不保证读取和写入之间的原子性。' },
                     name: { type: 'string', description: '新的接口名称（可选）' },
                     method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: '新的HTTP方法（可选）' },
@@ -1087,6 +1212,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 },
                 required: ['target_id'],
                 additionalProperties: false
+            }
+        },
+        {
+            name: 'apipost_sync_batch',
+            description: '整批预检后顺序新增或更新，新增统一按method+path查重，更新须有已合并字段组和expected_fingerprint；无变化跳过。最后一次完整回读自动验收，返回逐项结果、差异路径及耗时，不返回大型示例。不删除或移动对象，不自动重试结果不明的写入。',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    items: {
+                        type: 'array', minItems: 1, maxItems: 100,
+                        items: {
+                            type: 'object', additionalProperties: false,
+                            properties: {
+                                key: { type: 'string', description: '调用方本批唯一键' },
+                                action: { type: 'string', enum: ['create', 'update'] },
+                                target_id: { type: 'string' }, expected_fingerprint: { type: 'string' },
+                                parent_id: { type: 'string', description: '仅新增可传，更新不支持移动目录' },
+                                name: { type: 'string' }, method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] },
+                                url: { type: 'string' }, description: { type: 'string' },
+                                headers: { type: 'string' }, query: { type: 'string' }, cookies: { type: 'string' },
+                                restful: { type: 'string' }, body: { type: 'string' }, bodyRaw: { type: 'string' },
+                                auth: { type: 'string' }, responses: { type: 'string', description: '字段组均沿用单接口 JSON 字符串契约；responses 用 fields+data 或完整原生响应' }
+                            },
+                            required: ['key', 'action']
+                        }
+                    }
+                }, required: ['items'], additionalProperties: false
             }
         },
         {
@@ -1124,7 +1276,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         type: 'array',
                         items: { type: 'string' },
                         description: 'API接口ID数组（可从列表中获取target_id）- 支持单个["id1"]或多个["id1","id2","id3"]'
-                    }
+                    },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text；json 额外查询有效列表，区分请求成功与已确认移除。' }
                 },
                 required: ['api_ids']
             }
@@ -1545,6 +1698,11 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (createFolderResult.data.code !== 0) {
                     throw new Error(`创建目录失败: ${createFolderResult.data.msg}`);
                 }
+                if (args.format === 'json') {
+                    const id = createFolderResult.data.data?.target_id;
+                    if (!id) throw new Error('目录创建请求成功，但服务端未确认目标 ID，请按本次目录名定位');
+                    return jsonResult({ request_succeeded: true, target_id: id, target_type: 'folder', name: folderName, parent_id: folderParentId });
+                }
 
                 return {
                     content: [{
@@ -1566,15 +1724,13 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 const queryCount = config.query?.length || 0;
                 const bodyCount = config.body?.length || 0;
                 const responseCount = config.responses?.length || 0;
-                const createResult = await apiClient.post('/open/apis/create', template);
-                if (createResult.data.code !== 0) {
-                    throw new Error(`创建失败: ${createResult.data.msg}`);
-                }
+                const createdId = await writeApi('create', template);
+                if (args.format === 'json') return jsonResult({ request_succeeded: true, target_id: createdId, parent_id: template.parent_id, method: template.method, url: template.url });
 
                 return {
                     content: [{
                             type: 'text',
-                            text: `API创建成功!\n名称: ${args.name}\n方法: ${args.method}\nURL: ${args.url}\nID: ${createResult.data.data.target_id}\n\n字段统计:\n• Headers: ${headerCount}个\n• Query参数: ${queryCount}个\n• Body参数: ${bodyCount}个\n• 响应示例: ${responseCount}个`
+                            text: `API创建成功!\n名称: ${args.name}\n方法: ${args.method}\nURL: ${args.url}\nID: ${createdId}\n\n字段统计:\n• Headers: ${headerCount}个\n• Query参数: ${queryCount}个\n• Body参数: ${bodyCount}个\n• 响应示例: ${responseCount}个`
                         }]
                 };
             case 'apipost_list':
@@ -1646,6 +1802,12 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                     filterInfo.push(`深度限制: ${depth}`);
                 const logInfo = filterInfo.length > 0 ? `\n筛选条件: ${filterInfo.join(', ')}` : '';
                 const limitInfo = isLimited ? `\n显示限制: 前${limit}条` : '';
+                if (args.format === 'json') return jsonResult({
+                    project_id: currentWorkspace.projectId, total_count: totalCount, matched_count: filteredCount,
+                    returned_count: displayItems.length, truncated: isLimited,
+                    items: displayItems.map(item => ({ target_id: item.target_id, target_type: item.target_type, parent_id: item.parent_id,
+                        name: item.name, method: item.method, url: item.url, status: item.status }))
+                });
 
                 return {
                     content: [{ type: 'text', text: listResult_display }]
@@ -1676,96 +1838,11 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (args.expected_fingerprint !== undefined && args.expected_fingerprint !== documentFingerprint(originalApi)) {
                     throw new Error('接口内容已变化，已停止写入；请重新读取完整详情并合并本次变更');
                 }
-                // 构建增量更新配置对象
-                const { config: newConfig, providedFields } = buildApiConfig(args);
-                const mergedDescription = providedFields.has('description')
-                    ? newConfig.description
-                    : (originalApi.description || '');
-                const mergedRequest = {
-                    ...(originalApi.request || {}),
-                    auth: providedFields.has('auth') ? (newConfig.auth || { type: 'inherit' }) : (originalApi.request?.auth || { type: 'inherit' }),
-                    pre_tasks: originalApi.request?.pre_tasks || [],
-                    post_tasks: originalApi.request?.post_tasks || [],
-                    header: {
-                        ...(originalApi.request?.header || {}),
-                        parameter: providedFields.has('headers')
-                            ? convertParams(newConfig.headers || [])
-                            : (originalApi.request?.header?.parameter || [])
-                    },
-                    query: {
-                        ...(originalApi.request?.query || {}),
-                        query_add_equal: originalApi.request?.query?.query_add_equal ?? 1,
-                        parameter: providedFields.has('query')
-                            ? convertParams(newConfig.query || [])
-                            : (originalApi.request?.query?.parameter || [])
-                    },
-                    body: providedFields.has('body') || providedFields.has('bodyRaw')
-                        ? {
-                            ...(originalApi.request?.body || {}),
-                            ...buildBodySection(
-                                newConfig.body || [],
-                                providedFields.has('bodyRaw') ? newConfig.bodyRaw
-                                    : newConfig.body?.length > 0 && originalApi.request?.body?.mode === 'json'
-                                        && originalApi.request.body.raw ? originalApi.request.body.raw : undefined),
-                            ...(!providedFields.has('body') ? {
-                                raw_parameter: originalApi.request?.body?.raw_parameter || [],
-                                raw_schema: originalApi.request?.body?.raw_schema || { type: 'object' }
-                            } : {})
-                        }
-                        : (originalApi.request?.body || buildBodySection([])),
-                    cookie: {
-                        ...(originalApi.request?.cookie || {}),
-                        cookie_encode: originalApi.request?.cookie?.cookie_encode ?? 1,
-                        parameter: providedFields.has('cookies')
-                            ? convertParams(newConfig.cookies || [])
-                            : (originalApi.request?.cookie?.parameter || [])
-                    },
-                    restful: {
-                        ...(originalApi.request?.restful || {}),
-                        parameter: providedFields.has('restful')
-                            ? convertParams(newConfig.restful || [])
-                            : (originalApi.request?.restful?.parameter || [])
-                    }
-                };
-                const responseSection = providedFields.has('responses')
-                    ? normalizeResponses(newConfig.responses, {
-                        fallbackExamples: [],
-                        useDefaultWhenMissing: false,
-                        keepEmpty: true,
-                        isCheckResult: originalApi.response?.is_check_result ?? 1
-                    })
-                    : {
-                        ...(originalApi.response || {}),
-                        example: originalApi.response?.example || [],
-                        is_check_result: originalApi.response?.is_check_result ?? 1
-                    };
-                const updateTemplate = {
-                    project_id: currentWorkspace.projectId,
-                    target_id: targetId,
-                    parent_id: originalApi.parent_id || '0',
-                    target_type: originalApi.target_type || 'api',
-                    name: newName || originalApi.name,
-                    method: newMethod || originalApi.method,
-                    url: newUrl || originalApi.url,
-                    protocol: originalApi.protocol || 'http/1.1',
-                    description: mergedDescription,
-                    version: (originalApi.version || 0) + 1,
-                    mark_id: originalApi.mark_id || '1',
-                    is_force: originalApi.is_force ?? -1,
-                    sort: originalApi.sort ?? 0,
-                    status: originalApi.status ?? 1,
-                    is_deleted: originalApi.is_deleted ?? -1,
-                    is_conflicted: originalApi.is_conflicted ?? -1,
-                    request: mergedRequest,
-                    response: responseSection,
-                    attribute_info: originalApi.attribute_info || {},
-                    tags: originalApi.tags || []
-                };
+                const updateTemplate = buildUpdateTemplate(args, originalApi);
+                const { providedFields } = buildApiConfig(args);
                 // 执行修改
-                const updateResult = await apiClient.post('/open/apis/update', updateTemplate);
-                if (updateResult.data.code !== 0) {
-                    throw new Error(`修改失败: ${updateResult.data.msg}`);
-                }
+                await writeApi('update', updateTemplate);
+                if (args.format === 'json') return jsonResult({ request_succeeded: true, target_id: targetId, verified: false });
                 // 统计修改的字段
                 const changedFields = [];
                 if (newName && newName !== originalApi.name)
@@ -1790,6 +1867,12 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 return {
                     content: [{ type: 'text', text: updateText }]
                 };
+            case 'apipost_sync_batch':
+                if (!checkSecurityPermission('write')) throw new Error('当前安全模式不允许写入');
+                return jsonResult(await syncBatch(args.items, {
+                    list: projectList, details: completeDetails, prepare: prepareBatchItem,
+                    fingerprint: documentFingerprint, url: applyUrlPrefix, write: writeApi
+                }));
             case 'apipost_details':
                 if (!checkSecurityPermission('read')) throw new Error('当前安全模式不允许读取操作');
                 if (!Array.isArray(args.target_ids) || args.target_ids.length < 1 || args.target_ids.length > 100
@@ -1960,6 +2043,16 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 const deleteResult = await apiClient.post('/open/apis/delete', deleteData);
                 if (deleteResult.data.code !== 0) {
                     throw new Error(`删除失败: ${deleteResult.data.msg}`);
+                }
+                if (args.format === 'json') {
+                    try {
+                        const active = await projectList();
+                        const remaining = apiIds.filter(id => active.some(item => item.target_id === id));
+                        return jsonResult({ request_succeeded: true, removed: apiIds.filter(id => !remaining.includes(id)), remaining,
+                            verified: remaining.length === 0 });
+                    } catch {
+                        return jsonResult({ request_succeeded: true, verified: false, remaining: apiIds, verification_error: '有效列表回读失败' });
+                    }
                 }
 
                 let deleteText = `批量删除完成!\n删除数量: ${apiIds.length} 个接口\n删除的ID:\n`;

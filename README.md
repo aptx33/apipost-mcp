@@ -112,6 +112,7 @@ npm install && npm run build
 | `apipost_details` | 批量完整详情及内容指纹 | `target_ids`（1～100个） |
 | `apipost_detail` | 单接口详情，默认摘要 | `target_id`, `format: "json"` 获取完整内容 |
 | `apipost_update` | 增量修改接口 | `target_id`, `expected_fingerprint`, 其他可选 |
+| `apipost_sync_batch` | 整批预检、查重、顺序写入和自动验收 | `items` 对象数组（1～100项） |
 | `apipost_delete` | 删除接口 | `api_ids` |
 
 ### apipost_test_connection 说明
@@ -220,9 +221,47 @@ apipost_create_folder name: "认证接口" parent_id: "folder_123" description: 
 
 完整数据可在工具编排中程序比较，仅输出差异摘要，避免大型示例反复进入模型上下文。HTTP 耗时日志只记录方法、路径、状态和耗时，不记录凭据及请求响应正文。新工具需要客户端重新连接 MCP 后发现。
 
+### 结构化结果与批量同步
+
+列表、目录创建、接口创建、更新、删除工具支持 `format:"json"`，默认文本输出不变。JSON 通过现有 SDK 的文本内容块返回；不再解析“目录ID”或搜索提示等展示文案。列表给出 `items`、`matched_count`、`returned_count`、`truncated`；创建返回服务端确认的 `target_id`；删除区分 `request_succeeded` 和 `verified`，以官方有效列表中目标 ID 不再存在为验收依据，兼容详情仍返回 `status=-1` 的已删除对象。
+
+`apipost_sync_batch` 接收 `items` 对象数组。每项含本批唯一 `key`、明确的 `action:create|update`，以及原单接口字段；字段组仍为 JSON 数组字符串。更新必须提供 `target_id`、`expected_fingerprint` 和已合并的变更字段组，不接受 `parent_id`，不会自行移动目录或覆盖人工内容。
+
+```json
+{
+  "items": [{
+    "key": "example",
+    "action": "create",
+    "parent_id": "目标目录ID",
+    "name": "示例接口",
+    "method": "POST",
+    "url": "http://localhost/epm/example",
+    "body": "[{\"key\":\"remark\",\"type\":\"string\",\"desc\":\"备注，可为空\",\"required\":false}]",
+    "bodyRaw": "{\"remark\":null}",
+    "responses": "[{\"name\":\"成功\",\"status\":200,\"data\":{\"success\":true},\"fields\":[{\"key\":\"success\",\"type\":\"boolean\",\"desc\":\"是否成功\"}]}]"
+  }]
+}
+```
+
+整批先本地预检，失败则不写入；新增按 method＋规范化路径统一查重，不自动转更新。更新检查最新指纹，无变化跳过。顺序写入后一次完整回读，自动比较本次字段说明、类型、必填、schema 及真实请求响应，忽略版本和自动参数 ID。
+
+结果返回逐项 `created|updated|unchanged|conflict|failed|unverified`、目标 ID、可取得的云端实际版本、差异路径及阶段耗时。独立明确失败不阻塞其他项；网络结果不明时停止后续写入，尝试定位后回读，不盲目重试新增，不自动回滚已成功内容。大型示例不进入结果摘要，仍可通过完整详情查询。
+
+### 临时新增测速
+
+明确授权后，通过仓库内固定脚本复用上述批量同步与验收：
+
+```sh
+node scripts/benchmark-sync.mjs --source-ids=id1,id2,id3 --allow-temporary-write-and-cleanup
+```
+
+环境变量通过现有安全方式注入，包含凭据及仅当前独立进程的 `APIPOST_SECURITY_MODE=full`；脚本不读取个人配置、不修改宿主安全模式。它复制来源业务字段及示例，不复制认证和任务脚本，创建唯一目录及独立测试路径，测后在 finally 中只删除本批登记或精确恢复的对象，先接口后空目录。清理失败报告遗留 ID，不扩大范围；验证原接口内容指纹未变。
+
+输出包含准备、建目录、批量处理、清理、原接口核对及脚本总耗时；批量结果另含写入和验收耗时。用户请求到交付的端到端耗时须另计，不用脚本耗时替代。
+
 ### 本地验证
 
-运行 `npm test`，先构建，再通过真实 MCP stdio 协议连接本机模拟 ApiPost，覆盖完整批量回读、选填、示例保真、增量修改及指纹冲突；测试不读取个人配置或连接真实 ApiPost。
+运行 `npm test`，先构建，再通过真实 MCP stdio 协议连接本机模拟 ApiPost，覆盖结构化结果、完整批量同步、选填和示例保真、指纹冲突、失败恢复及测速清理；测试不读取个人配置或连接真实 ApiPost。
 
 ## 获取 Token
 
