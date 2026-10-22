@@ -8,6 +8,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
+import { createHash } from 'node:crypto';
 // 环境变量验证
 const APIPOST_TOKEN = process.env.APIPOST_TOKEN;
 if (!APIPOST_TOKEN) {
@@ -27,6 +28,22 @@ const apiClient = axios.create({
         'Api-Token': APIPOST_TOKEN,
         'Content-Type': 'application/json'
     }
+});
+apiClient.interceptors.request.use(config => {
+    config.requestStartedAt = Date.now();
+    return config;
+});
+function logRequestDuration(config, status) {
+    if (!config)
+        return;
+    console.error(`[ApiPost] ${config.method?.toUpperCase()} ${config.url?.split('?')[0]} ${status} ${Date.now() - config.requestStartedAt}ms`);
+}
+apiClient.interceptors.response.use(response => {
+    logRequestDuration(response.config, response.status);
+    return response;
+}, error => {
+    logRequestDuration(error.config, error.response?.status || 'failed');
+    return Promise.reject(error);
 });
 // 安全模式检查
 function checkSecurityPermission(operation) {
@@ -67,17 +84,34 @@ function logWithTime(message, startTime) {
     console.error(message);
 }
 // 统一转换参数格式
+function fieldExample(field, fallback = '') {
+    if (Object.hasOwn(field, 'example'))
+        return field.example;
+    if (Object.hasOwn(field, 'value'))
+        return field.value;
+    return fallback;
+}
+function requiredFlag(param) {
+    if (param.required !== undefined && typeof param.required !== 'boolean') {
+        throw new Error(`字段 ${param.key} 的 required 必须为 boolean`);
+    }
+    if (param.autoParent)
+        return -1;
+    if (param.required !== undefined)
+        return param.required ? 1 : -1;
+    return Number(param.not_null) === 1 ? 1 : -1;
+}
 function convertParams(paramsList) {
     if (!paramsList || !Array.isArray(paramsList))
         return [];
     return paramsList.map(param => ({
-        param_id: generateId(),
+        param_id: param.param_id || generateId(),
         description: param.desc || param.description || '',
         field_type: param.type || param.field_type || 'string',
         is_checked: param.autoParent ? 0 : (param.required ? 1 : (param.is_checked ?? 0)),
         key: param.key,
-        not_null: param.autoParent ? 0 : (param.required ? 1 : (param.not_null ?? 0)),
-        value: param.autoParent ? '' : (param.example ?? param.value ?? ''),
+        not_null: requiredFlag(param),
+        value: param.autoParent ? '' : fieldExample(param),
         schema: param.schema || { type: param.type || 'string' }
     }));
 }
@@ -216,7 +250,7 @@ function buildJsonFromFieldList(fields) {
                     current[seg.key].push({});
                 }
                 if (isLeaf) {
-                    const val = field.example ?? field.value ?? defaultValueByType(field.type);
+                    const val = fieldExample(field, defaultValueByType(field.type));
                     current[seg.key][0] = val;
                 }
                 else {
@@ -228,7 +262,7 @@ function buildJsonFromFieldList(fields) {
             }
             else {
                 if (isLeaf) {
-                    const val = field.example ?? field.value ?? defaultValueByType(field.type);
+                    const val = fieldExample(field, defaultValueByType(field.type));
                     current[seg.key] = val;
                 }
                 else {
@@ -249,12 +283,12 @@ function generateRequestBodyFromParams(bodyParams) {
     return buildJsonFromFieldList(bodyParams);
 }
 // 构造 Body 区块（用于 create/update）
-function buildBodySection(bodyParams) {
-    const hasBody = Array.isArray(bodyParams) && bodyParams.length > 0;
+function buildBodySection(bodyParams, bodyRaw) {
+    const hasBody = bodyRaw !== undefined || (Array.isArray(bodyParams) && bodyParams.length > 0);
     const expandedFields = expandFieldListWithParents(bodyParams || []);
     const rawBody = generateRequestBodyFromParams(expandedFields);
     const descMap = buildDescMap(expandedFields);
-    const rawString = hasBody
+    const rawString = bodyRaw !== undefined ? bodyRaw : hasBody
         ? (APIPOST_INLINE_COMMENTS
             ? stringifyWithComments(rawBody, descMap)
             : JSON.stringify(rawBody, null, 4))
@@ -305,10 +339,10 @@ function buildSchemaFromFields(fields) {
                 if (!current.properties)
                     current.properties = {};
                 const schemaType = (field.type || 'string').toLowerCase();
-                const node = { type: schemaType };
+                const node = field.schema ? JSON.parse(JSON.stringify(field.schema)) : { type: schemaType };
                 if (field.desc)
                     node.description = field.desc;
-                if (schemaType === 'array') {
+                if (schemaType === 'array' && !node.items) {
                     node.items = { type: 'object', properties: {} };
                 }
                 current.properties[cleanKey] = node;
@@ -391,14 +425,14 @@ function normalizeResponses(responses, options = {}) {
         example_id: String(index + 1),
         raw: (() => {
             // 如果提供了 data 字段，直接作为响应示例（支持完整多对象数组）
-            if (resp.data) {
+            if (Object.hasOwn(resp, 'data')) {
                 const dataStr = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 4);
                 try {
                     const parsed = JSON.parse(dataStr);
                     return JSON.stringify(parsed, null, 4);
                 }
                 catch {
-                    return dataStr;
+                    return JSON.stringify(resp.data);
                 }
             }
             const fields = Array.isArray(resp.fields) ? resp.fields : [];
@@ -419,13 +453,13 @@ function normalizeResponses(responses, options = {}) {
             content_type: 'application/json',
             is_default: index === 0 ? 1 : -1,
             mock: (() => {
-                if (resp.data) {
+                if (Object.hasOwn(resp, 'data')) {
                     const dataStr = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
                     try {
                         return JSON.stringify(JSON.parse(dataStr));
                     }
                     catch {
-                        return dataStr;
+                        return JSON.stringify(resp.data);
                     }
                 }
                 return JSON.stringify(buildJsonFromFieldList(expandFieldListWithParents(resp.fields || [])));
@@ -741,15 +775,16 @@ function parseApiConfig(configJson) {
 }
 // 解析单个配置参数
 function parseConfigParam(paramJson) {
-    if (!paramJson)
-        return [];
+    if (typeof paramJson !== 'string')
+        throw new Error('字段组必须为 JSON 数组字符串');
     try {
         const parsed = JSON.parse(paramJson);
-        return Array.isArray(parsed) ? parsed : [];
+        if (!Array.isArray(parsed))
+            throw new Error('必须为数组');
+        return parsed;
     }
     catch (error) {
-        console.error('解析配置参数失败:', error);
-        return [];
+        throw new Error('字段组不是合法 JSON 数组，已停止写入');
     }
 }
 function ensureFieldsHaveDesc(list, context) {
@@ -764,13 +799,21 @@ function ensureResponsesFieldsHaveDesc(responses) {
     if (!Array.isArray(responses))
         return;
     responses.forEach((resp, index) => {
-        if (resp && Array.isArray(resp.fields)) {
+        if (isApiPostResponseExample(resp)) {
+            if (typeof resp.raw !== 'string' || typeof resp.expect?.mock !== 'string' || !resp.expect?.schema) {
+                throw new Error(`responses[${index}] 原生响应须包含 raw、expect.mock 和 expect.schema`);
+            }
+        }
+        else if (resp && Array.isArray(resp.fields) && resp.fields.length > 0) {
             ensureFieldsHaveDesc(resp.fields, `responses[${index}].fields`);
         }
         else {
             throw new Error(`responses[${index}] 未提供 fields 或格式不正确`);
         }
     });
+    if (responses.some(isApiPostResponseExample) && !responses.every(isApiPostResponseExample)) {
+        throw new Error('responses 不得混用原生响应和 fields/data 格式');
+    }
 }
 // 构建配置对象，同时记录哪些字段被明确提供了
 function buildApiConfig(args) {
@@ -794,6 +837,18 @@ function buildApiConfig(args) {
         config.body = parseConfigParam(args.body);
         ensureFieldsHaveDesc(config.body, 'body');
         providedFields.add('body');
+    }
+    if (args.bodyRaw !== undefined) {
+        if (typeof args.bodyRaw !== 'string')
+            throw new Error('bodyRaw 必须为 JSON 字符串');
+        try {
+            JSON.parse(args.bodyRaw);
+        }
+        catch {
+            throw new Error('bodyRaw 不是合法 JSON，已停止写入');
+        }
+        config.bodyRaw = args.bodyRaw;
+        providedFields.add('bodyRaw');
     }
     if (args.cookies !== undefined) {
         config.cookies = parseConfigParam(args.cookies);
@@ -840,7 +895,7 @@ function generateApiTemplate(method, url, name, config = {}) {
                 query_add_equal: 1,
                 parameter: convertParams(config.query || [])
             },
-            body: buildBodySection(config.body || []),
+            body: buildBodySection(config.body || [], config.bodyRaw),
             cookie: {
                 cookie_encode: 1,
                 parameter: convertParams(config.cookies || [])
@@ -852,6 +907,30 @@ function generateApiTemplate(method, url, name, config = {}) {
         response: normalizeResponses(config.responses, { useDefaultWhenMissing: true, keepEmpty: true, isCheckResult: 1 }),
         attribute_info: config.attribute_info || {},
         tags: config.tags || []
+    };
+}
+function canonicalize(value) {
+    if (Array.isArray(value))
+        return value.map(canonicalize);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+    }
+    return value;
+}
+function documentFingerprint(api) {
+    const fields = ['target_id', 'parent_id', 'name', 'method', 'url', 'description',
+        'protocol', 'request', 'response', 'attribute_info', 'tags', 'is_deleted'];
+    const content = Object.fromEntries(fields.filter(key => Object.hasOwn(api, key)).map(key => [key, api[key]]));
+    return createHash('sha256').update(JSON.stringify(canonicalize(content))).digest('hex');
+}
+function detailJsonResult(apis, targetIds) {
+    const byId = new Map(apis.map(api => [api.target_id, api]));
+    const list = targetIds.filter(id => byId.has(id)).map(id => byId.get(id));
+    return {
+        project_id: currentWorkspace.projectId,
+        list,
+        fingerprints: Object.fromEntries(list.map(api => [api.target_id, documentFingerprint(api)])),
+        missing_ids: targetIds.filter(id => !byId.has(id))
     };
 }
 // 工作空间信息
@@ -973,7 +1052,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'apipost_smart_create',
-            description: 'API接口文档生成器（字段列表驱动）。规则：responses 只传 fields，不传 data；headers/query/body/cookies 统一用字段列表，嵌套用 .，数组用 []；example 填真实值（不要 JSON 字符串）；所有字段含父级都必须写 desc，父级需显式声明。例如：{"key":"data","desc":"返回体","type":"object"},{"key":"data.user","desc":"用户","type":"object"},{"key":"data.user.id","desc":"用户ID","type":"integer","example":1}',
+            description: '创建接口文档。字段列表负责说明；bodyRaw 直接传真实 JSON 请求，responses 同时传 fields 和真实 data，或完整原生 raw/expect 响应。所有字段含父级填写 desc；required 为 boolean，false 为选填。不通过字段默认值重建真实示例。',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -984,11 +1063,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     description: { type: 'string', description: '接口详细描述（可选）' },
                     headers: { type: 'string', description: 'Headers字段列表字符串，格式：[{"key":"X-Request-ID","type":"string","required":false,"example":"req-1","desc":"说明"}]' },
                     query: { type: 'string', description: 'Query字段列表字符串，格式同上。嵌套用 .，数组用 []（如 meta.flags.debug 或 items[].id）。' },
-                    body: { type: 'string', description: 'Body字段列表字符串，仅用字段列表生成 raw/参数描述，example 用真实值，不要放 JSON 字符串。' },
+                    body: { type: 'string', description: 'Body字段列表 JSON 字符串，填写字段说明；真实请求示例优先通过 bodyRaw 独立传入。' },
+                    bodyRaw: { type: 'string', description: '完整真实 JSON 请求字符串，原样写入，不从字段 example 重建；保留 null、空串、布尔和完整数组。' },
                     cookies: { type: 'string', description: 'Cookies字段列表字符串，格式同上。' },
                     restful: { type: 'string', description: 'RESTful路径参数字段列表字符串。URL中用 :变量名 表示路径参数，此处定义参数描述。格式：[{"key":"id","desc":"用户ID","type":"string","required":true,"example":"12345"}]' },
                     auth: { type: 'string', description: '认证配置JSON字符串（可选）。格式：{"type":"bearer","bearer":{"key":"your_token"}}' },
-                    responses: { type: 'string', description: '响应字段列表字符串（必填 fields），格式：[{"name":"成功","status":200,"fields":[{"key":"code","type":"integer","example":0,"desc":"状态码"},{"key":"data.items[].id","type":"string","example":"1"}]}]' }
+                    responses: { type: 'string', description: 'JSON 数组字符串。简化格式：[{"name":"成功","status":200,"data":{"success":true},"fields":[{"key":"success","type":"boolean","desc":"是否成功"}]}]；也可传完整原生 raw/expect。data 为同次完整真实响应，schema 可显式指定，字段 schema 支持 nullable 和数组 items。' }
                 },
                 required: ['method', 'url', 'name'],
                 additionalProperties: false
@@ -1015,11 +1095,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'apipost_update',
-            description: '修改API接口文档。规则同创建：responses 只用 fields（必填），不要传 data；headers/query/body/cookies 统一用字段列表，嵌套用 .，数组用 []，example 填真实值；所有字段含父级必须写 desc，父级需显式声明。例如：{"key":"data","desc":"返回体","type":"object"},{"key":"data.user","desc":"用户","type":"object"},{"key":"data.user.id","desc":"用户ID","type":"integer","example":1}',
+            description: '增量修改接口，未传字段组保持原值，传入字段组整体替换。先完整读取并合并目标字段组，带 expected_fingerprint 检查期间是否变化；冲突停止写入。bodyRaw 独立保留真实请求，responses 使用 fields+data 或原生 raw/expect，required:false 为选填。',
             inputSchema: {
                 type: 'object',
                 properties: {
                     target_id: { type: 'string', description: '要修改的接口ID' },
+                    expected_fingerprint: { type: 'string', description: '完整详情返回的内容指纹；与内部最新读取不一致时停止写入，防止用旧字段组覆盖新修改。不保证读取和写入之间的原子性。' },
                     name: { type: 'string', description: '新的接口名称（可选）' },
                     method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: '新的HTTP方法（可选）' },
                     url: { type: 'string', description: '新的接口URL（可选）' },
@@ -1027,6 +1108,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     headers: { type: 'string', description: 'Headers参数JSON数组字符串（可选）。提供"[]"可删除所有headers。格式：[{"key":"Content-Type","desc":"内容类型","type":"string","required":true,"example":"application/json"}]' },
                     query: { type: 'string', description: 'Query参数JSON数组字符串（可选）。提供"[]"可删除所有query参数。格式：[{"key":"page","desc":"页码","type":"integer","required":false,"example":"1"}]' },
                     body: { type: 'string', description: 'Body参数JSON数组字符串（可选）。提供"[]"可删除所有body参数。格式：[{"key":"name","desc":"用户名","type":"string","required":true,"example":"张三"}]' },
+                    bodyRaw: { type: 'string', description: '完整真实 JSON 请求字符串。省略时保留已有请求原文；只传 bodyRaw 不改变字段说明。明确 body:[] 且不传 bodyRaw 时清空请求体。' },
                     cookies: { type: 'string', description: 'Cookies参数JSON数组字符串（可选）。提供"[]"可删除所有cookies。格式：[{"key":"session_id","desc":"会话ID","type":"string","required":false,"example":"abc123"}]' },
                     restful: { type: 'string', description: 'RESTful路径参数JSON数组字符串（可选）。URL中用 :变量名 表示路径参数。格式：[{"key":"id","desc":"用户ID","type":"string","required":true,"example":"12345"}]' },
                     auth: { type: 'string', description: '认证配置JSON字符串（可选）。提供"{}"可删除认证配置。格式：{"type":"bearer","bearer":{"key":"your_token"}}' },
@@ -1037,12 +1119,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             }
         },
         {
-            name: 'apipost_detail',
-            description: '查看API接口的详细配置信息，包括完整的请求参数、响应格式、认证设置等。',
+            name: 'apipost_details',
+            description: '一次读取多个接口的完整原生 JSON，不截断 raw、expect.mock、schema 或请求参数。返回 list、内容 fingerprints 和 missing_ids；用于合并底稿及程序化写后校验。',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    target_id: { type: 'string', description: '要查看的接口ID' }
+                    target_ids: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1, maxItems: 100, uniqueItems: true, description: '本次目标接口 ID，最多100个；只读取明确的目标。' }
+                },
+                required: ['target_ids'],
+                additionalProperties: false
+            }
+        },
+        {
+            name: 'apipost_detail',
+            description: '读取单接口。format=json 返回完整原生 JSON、内容指纹及缺失 ID；默认 text 是便于浏览的摘要，会截断响应，不可作为完整合并或示例验收依据。多个接口优先 apipost_details。',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    target_id: { type: 'string', description: '要查看的接口ID' },
+                    format: { type: 'string', enum: ['text', 'json'], description: '默认 text 摘要；json 返回完整数据，不截断。' }
                 },
                 required: ['target_id'],
                 additionalProperties: false
@@ -1600,36 +1695,53 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (!originalApi) {
                     throw new Error(`未找到接口详情 (ID: ${targetId})。可能原因：1) 接口不存在 2) 无权限访问 3) 接口已被删除。请检查接口ID是否正确。`);
                 }
+                if (args.expected_fingerprint !== undefined && args.expected_fingerprint !== documentFingerprint(originalApi)) {
+                    throw new Error('接口内容已变化，已停止写入；请重新读取完整详情并合并本次变更');
+                }
                 // 构建增量更新配置对象
                 const { config: newConfig, providedFields } = buildApiConfig(args);
                 const mergedDescription = providedFields.has('description')
                     ? newConfig.description
                     : (originalApi.description || '');
                 const mergedRequest = {
+                    ...(originalApi.request || {}),
                     auth: providedFields.has('auth') ? (newConfig.auth || { type: 'inherit' }) : (originalApi.request?.auth || { type: 'inherit' }),
                     pre_tasks: originalApi.request?.pre_tasks || [],
                     post_tasks: originalApi.request?.post_tasks || [],
                     header: {
+                        ...(originalApi.request?.header || {}),
                         parameter: providedFields.has('headers')
                             ? convertParams(newConfig.headers || [])
                             : (originalApi.request?.header?.parameter || [])
                     },
                     query: {
+                        ...(originalApi.request?.query || {}),
                         query_add_equal: originalApi.request?.query?.query_add_equal ?? 1,
                         parameter: providedFields.has('query')
                             ? convertParams(newConfig.query || [])
                             : (originalApi.request?.query?.parameter || [])
                     },
-                    body: providedFields.has('body')
-                        ? buildBodySection(newConfig.body || [])
+                    body: providedFields.has('body') || providedFields.has('bodyRaw')
+                        ? {
+                            ...(originalApi.request?.body || {}),
+                            ...buildBodySection(newConfig.body || [], providedFields.has('bodyRaw') ? newConfig.bodyRaw
+                                : newConfig.body?.length > 0 && originalApi.request?.body?.mode === 'json'
+                                    && originalApi.request.body.raw ? originalApi.request.body.raw : undefined),
+                            ...(!providedFields.has('body') ? {
+                                raw_parameter: originalApi.request?.body?.raw_parameter || [],
+                                raw_schema: originalApi.request?.body?.raw_schema || { type: 'object' }
+                            } : {})
+                        }
                         : (originalApi.request?.body || buildBodySection([])),
                     cookie: {
+                        ...(originalApi.request?.cookie || {}),
                         cookie_encode: originalApi.request?.cookie?.cookie_encode ?? 1,
                         parameter: providedFields.has('cookies')
                             ? convertParams(newConfig.cookies || [])
                             : (originalApi.request?.cookie?.parameter || [])
                     },
                     restful: {
+                        ...(originalApi.request?.restful || {}),
                         parameter: providedFields.has('restful')
                             ? convertParams(newConfig.restful || [])
                             : (originalApi.request?.restful?.parameter || [])
@@ -1643,6 +1755,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                         isCheckResult: originalApi.response?.is_check_result ?? 1
                     })
                     : {
+                        ...(originalApi.response || {}),
                         example: originalApi.response?.example || [],
                         is_check_result: originalApi.response?.is_check_result ?? 1
                     };
@@ -1692,10 +1805,24 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                     updateText += `新方法: ${newMethod}\n`;
                 if (newUrl)
                     updateText += `新URL: ${newUrl}\n`;
-                updateText += `版本: v${updateTemplate.version}\n修改字段: ${changedFields.join(', ') || '仅更新版本'}`;
+                updateText += `修改字段: ${changedFields.join(', ') || '仅更新版本'}\n最终版本以完整回读为准`;
                 return {
                     content: [{ type: 'text', text: updateText }]
                 };
+            case 'apipost_details':
+                if (!checkSecurityPermission('read'))
+                    throw new Error('当前安全模式不允许读取操作');
+                if (!Array.isArray(args.target_ids) || args.target_ids.length < 1 || args.target_ids.length > 100
+                    || args.target_ids.some(id => typeof id !== 'string' || !id.trim())
+                    || new Set(args.target_ids).size !== args.target_ids.length) {
+                    throw new Error('target_ids 必须为1～100个不重复的非空接口 ID');
+                }
+                const batchResult = await apiClient.post('/open/apis/details', {
+                    project_id: currentWorkspace.projectId, target_ids: args.target_ids
+                });
+                if (batchResult.data.code !== 0)
+                    throw new Error(`获取详情失败: ${batchResult.data.msg}`);
+                return { content: [{ type: 'text', text: JSON.stringify(detailJsonResult(batchResult.data.data.list, args.target_ids)) }] };
             case 'apipost_detail':
                 if (!checkSecurityPermission('read')) {
                     throw new Error(`🔒 安全模式 "${APIPOST_SECURITY_MODE}" 不允许读取操作。`);
@@ -1711,6 +1838,9 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 });
                 if (detailResult.data.code !== 0) {
                     throw new Error(`获取接口详情失败: ${detailResult.data.msg}`);
+                }
+                if (args.format === 'json') {
+                    return { content: [{ type: 'text', text: JSON.stringify(detailJsonResult(detailResult.data.data.list, [detailTargetId])) }] };
                 }
                 const apiDetail = detailResult.data.data.list[0];
                 if (!apiDetail) {
@@ -1734,7 +1864,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (headers.length > 0) {
                     headers.forEach((header, index) => {
                         detailText += `   ${index + 1}. ${header.key}: ${header.description || '无描述'}\n`;
-                        detailText += `      类型: ${header.field_type || 'string'}, 必需: ${header.not_null ? '是' : '否'}\n`;
+                        detailText += `      类型: ${header.field_type || 'string'}, 必需: ${Number(header.not_null) === 1 ? '是' : '否'}\n`;
                         if (header.value)
                             detailText += `      示例: ${header.value}\n`;
                     });
@@ -1749,7 +1879,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (queryParams.length > 0) {
                     queryParams.forEach((param, index) => {
                         detailText += `   ${index + 1}. ${param.key}: ${param.description || '无描述'}\n`;
-                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${param.not_null ? '是' : '否'}\n`;
+                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${Number(param.not_null) === 1 ? '是' : '否'}\n`;
                         if (param.value)
                             detailText += `      示例: ${param.value}\n`;
                     });
@@ -1764,7 +1894,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (bodyParams.length > 0) {
                     bodyParams.forEach((param, index) => {
                         detailText += `   ${index + 1}. ${param.key}: ${param.description || '无描述'}\n`;
-                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${param.not_null ? '是' : '否'}\n`;
+                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${Number(param.not_null) === 1 ? '是' : '否'}\n`;
                         if (param.value)
                             detailText += `      示例: ${param.value}\n`;
                     });
@@ -1779,7 +1909,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (cookies.length > 0) {
                     cookies.forEach((cookie, index) => {
                         detailText += `   ${index + 1}. ${cookie.key}: ${cookie.description || '无描述'}\n`;
-                        detailText += `      类型: ${cookie.field_type || 'string'}, 必需: ${cookie.not_null ? '是' : '否'}\n`;
+                        detailText += `      类型: ${cookie.field_type || 'string'}, 必需: ${Number(cookie.not_null) === 1 ? '是' : '否'}\n`;
                         if (cookie.value)
                             detailText += `      示例: ${cookie.value}\n`;
                     });
@@ -1794,7 +1924,7 @@ ${connectionInfo.workspace ? `• 团队: ${connectionInfo.workspace.team_name}
                 if (restfulParams.length > 0) {
                     restfulParams.forEach((param, index) => {
                         detailText += `   ${index + 1}. ${param.key}: ${param.description || '无描述'}\n`;
-                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${param.not_null ? '是' : '否'}\n`;
+                        detailText += `      类型: ${param.field_type || 'string'}, 必需: ${Number(param.not_null) === 1 ? '是' : '否'}\n`;
                         if (param.value)
                             detailText += `      示例: ${param.value}\n`;
                     });
@@ -1899,7 +2029,7 @@ async function main() {
         console.error('='.repeat(50));
         console.error('🚀 ApiPost MCP 启动中...');
         console.error(`🔗 连接到: ${APIPOST_HOST}`);
-        console.error(`🔐 Token: ${APIPOST_TOKEN?.substring(0, 8)}...`);
+        console.error('🔐 Token: 已配置');
         // 预初始化工作空间以提高首次调用速度（在MCP连接前完成，避免日志重复）
         try {
             console.error('🔄 预初始化工作空间...');

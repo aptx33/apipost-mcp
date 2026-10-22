@@ -1,0 +1,226 @@
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { test } from 'node:test';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+
+// MCP 子进程仅连接本机模拟服务器，不读取任何个人配置或真实凭据。
+async function fixture(t, securityMode = 'limited') {
+    const documents = new Map();
+    const requests = [];
+    const mock = createServer(async (req, res) => {
+        let text = '';
+        for await (const chunk of req) text += chunk;
+        const body = text ? JSON.parse(text) : {};
+        requests.push({ path: req.url, body });
+        let data;
+        if (req.url === '/open/team/list') data = [{ team_id: 'team', name: 'mock-team' }];
+        else if (req.url.startsWith('/open/project/list')) data = [{ project_id: 'project', name: 'mock-project' }];
+        else if (req.url === '/open/apis/create' || req.url === '/open/apis/update') {
+            const doc = structuredClone(body);
+            // 模拟服务端规范化，验证客户端没有依赖本地推算的版本或参数值类型。
+            doc.version = 1000 + requests.length;
+            for (const group of [doc.request.header.parameter, doc.request.query.parameter, doc.request.body.raw_parameter]) {
+                for (const field of group) {
+                    if (field.not_null === 0) field.not_null = 1;
+                    field.value = typeof field.value === 'string' ? field.value : JSON.stringify(field.value);
+                }
+            }
+            documents.set(doc.target_id, doc);
+            data = { target_id: doc.target_id };
+        } else if (req.url === '/open/apis/details') {
+            data = { list: body.target_ids.filter(id => documents.has(id)).map(id => documents.get(id)).reverse() };
+        } else {
+            res.writeHead(404).end();
+            return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ code: 0, data }));
+    });
+    mock.listen(0, '127.0.0.1');
+    await once(mock, 'listening');
+    let logs = '';
+    let child;
+    // 当前 SDK 0.4 的 stdio 客户端固定继承 stderr；测试传输单独捕获日志以验证无凭据输出。
+    const transport = {
+        async start() {
+            child = spawn(process.execPath, ['dist/index.js'], { env: {
+                APIPOST_HOST: `http://127.0.0.1:${mock.address().port}`,
+                APIPOST_TOKEN: 'local-test-token',
+                APIPOST_SECURITY_MODE: securityMode,
+                APIPOST_DEFAULT_TEAM_NAME: 'mock-team',
+                APIPOST_DEFAULT_PROJECT_NAME: 'mock-project',
+                APIPOST_URL_PREFIX: '', APIPOST_INLINE_COMMENTS: 'false'
+            }, stdio: ['pipe', 'pipe', 'pipe'] });
+            child.stderr.on('data', chunk => { logs += chunk; });
+            createInterface({ input: child.stdout }).on('line', line => this.onmessage?.(JSON.parse(line)));
+            child.on('error', error => this.onerror?.(error));
+            child.on('close', () => this.onclose?.());
+            await once(child, 'spawn');
+        },
+        async send(message) { child.stdin.write(JSON.stringify(message) + '\n'); },
+        async close() {
+            if (child && child.exitCode === null) {
+                const closed = once(child, 'close');
+                child.kill();
+                await closed;
+            }
+        }
+    };
+    const client = new Client({ name: 'sync-test', version: '1' }, { capabilities: {} });
+    t.after(async () => {
+        await client.close();
+        await new Promise(resolve => mock.close(resolve));
+        assert.ok(!logs.includes('local-test-token'), '日志不得暴露凭据');
+    });
+    await client.connect(transport);
+    const call = (name, args) => client.callTool({ name, arguments: args });
+    const read = async ids => JSON.parse((await call('apipost_details', { target_ids: ids })).content[0].text);
+    return { documents, requests, call, read, client, logs: () => logs };
+}
+
+const rawRequest = JSON.stringify({ uuid: 'test-prescription', unanswered: null, empty: '', medication: false,
+    count: 0, symptoms: ['none', 'pain', 'pain'], nested: [{ value: null }, { value: true }] });
+const bodyFields = [
+    { key: 'uuid', type: 'string', desc: '处方标识', required: true, example: 'test-prescription' },
+    { key: 'unanswered', type: 'string', desc: '未回答', required: false, example: null },
+    { key: 'medication', type: 'boolean', desc: '是否用药', example: false },
+    { key: 'count', type: 'integer', desc: '次数', example: 0 }
+];
+const responseData = { success: true, message: { nullable: null, empty: '', flag: false,
+    symptoms: ['none', 'pain', 'pain'], rows: Array.from({ length: 7 }, (_, i) => ({ no: i + 1, text: '训练内容'.repeat(30) })) } };
+const responses = [{ name: '真实响应', status: 200, data: responseData, fields: [
+    { key: 'success', type: 'boolean', desc: '是否成功' },
+    { key: 'message', type: 'object', desc: '业务数据' },
+    { key: 'message.nullable', type: 'string', desc: '可空答案', schema: { type: ['string', 'null'] } },
+    { key: 'message.empty', type: 'string', desc: '备注' },
+    { key: 'message.flag', type: 'boolean', desc: '回答' },
+    { key: 'message.symptoms', type: 'array', desc: '多选答案', schema: { type: 'array', items: { type: 'string' } } },
+    { key: 'message.rows', type: 'array', desc: '七次记录' },
+    { key: 'message.rows[].no', type: 'integer', desc: '序号' },
+    { key: 'message.rows[].text', type: 'string', desc: '训练内容' }
+] }];
+async function create(f, extra = {}) {
+    const result = await f.call('apipost_smart_create', {
+        method: 'POST', url: 'http://localhost/epm/mock', name: '本地模拟接口',
+        body: JSON.stringify(bodyFields), bodyRaw: rawRequest, responses: JSON.stringify(responses), ...extra
+    });
+    assert.ok(!result.isError, result.content[0].text);
+    return [...f.documents.keys()].at(-1);
+}
+
+test('完整批量读取、选填转换、原文及响应类型保真', async t => {
+    const f = await fixture(t);
+    const tools = (await f.client.listTools()).tools;
+    assert.ok(tools.find(tool => tool.name === 'apipost_details'));
+    assert.ok(tools.find(tool => tool.name === 'apipost_smart_create').inputSchema.properties.bodyRaw);
+    assert.ok(tools.find(tool => tool.name === 'apipost_update').inputSchema.properties.expected_fingerprint);
+    const first = await create(f);
+    const second = await create(f, { url: '/second' });
+    const before = f.requests.length;
+    const detail = await f.read([first, second, 'missing']);
+    assert.equal(f.requests.length - before, 1, '批量回读只应有一次 HTTP 请求');
+    assert.deepEqual(detail.list.map(doc => doc.target_id), [first, second]);
+    assert.deepEqual(detail.missing_ids, ['missing']);
+    const beforeInvalid = f.requests.length;
+    const invalid = await f.call('apipost_details', { target_ids: [first, first] });
+    assert.equal(invalid.isError, true);
+    assert.equal(f.requests.length, beforeInvalid);
+    const doc = detail.list[0];
+    assert.equal(doc.request.body.raw, rawRequest);
+    assert.deepEqual(doc.request.body.raw_parameter.map(p => p.not_null), [1, -1, -1, -1]);
+    const response = doc.response.example[0];
+    assert.ok(response.raw.length > 200);
+    assert.deepEqual(JSON.parse(response.raw), responseData);
+    assert.deepEqual(JSON.parse(response.expect.mock), responseData);
+    assert.deepEqual(response.raw_parameter, []);
+    assert.deepEqual(response.expect.schema.properties.message.properties.nullable.type, ['string', 'null']);
+    assert.equal(response.expect.schema.properties.message.properties.symptoms.items.type, 'string');
+    const single = JSON.parse((await f.call('apipost_detail', { target_id: first, format: 'json' })).content[0].text);
+    assert.deepEqual(single.list, [doc]);
+    const text = (await f.call('apipost_detail', { target_id: first })).content[0].text;
+    assert.match(text, /未回答\n\s+类型: string, 必需: 否/);
+    assert.match(f.logs(), /\[ApiPost\] POST \/open\/apis\/details 200 \d+ms/);
+});
+
+test('文案和字段更新保留原始示例，指纹冲突停止写入', async t => {
+    const f = await fixture(t);
+    const id = await create(f);
+    f.documents.get(id).request.custom = { retained: true };
+    f.documents.get(id).request.query.custom = { retained: true };
+    f.documents.get(id).response.custom = { retained: true };
+    let detail = await f.read([id]);
+    const original = structuredClone(detail.list[0]);
+    let result = await f.call('apipost_update', { target_id: id, description: '新的调用说明',
+        expected_fingerprint: detail.fingerprints[id] });
+    assert.ok(!result.isError, result.content[0].text);
+    detail = await f.read([id]);
+    assert.deepEqual(detail.list[0].request, original.request);
+    assert.deepEqual(detail.list[0].response, original.response);
+    assert.equal(detail.fingerprints[id], (await f.read([id])).fingerprints[id], '无变化回读指纹应稳定');
+    result = await f.call('apipost_update', { target_id: id, body: JSON.stringify(bodyFields.map(p => ({ ...p, desc: p.desc + '说明' }))),
+        expected_fingerprint: detail.fingerprints[id] });
+    assert.ok(!result.isError, result.content[0].text);
+    assert.equal(f.documents.get(id).request.body.raw, rawRequest);
+    const after = await f.read([id]);
+    const fingerprint = after.fingerprints[id];
+    f.documents.get(id).request = Object.fromEntries(Object.entries(f.documents.get(id).request).reverse());
+    f.documents.get(id).version += 1;
+    assert.equal((await f.read([id])).fingerprints[id], fingerprint, '对象键顺序和服务端版本不改变内容指纹');
+    // 模拟另一用户在回读后修改字段。
+    f.documents.get(id).description = '人工新修改';
+    const writes = f.requests.filter(r => r.path === '/open/apis/update').length;
+    result = await f.call('apipost_update', { target_id: id, description: '过期草稿', expected_fingerprint: after.fingerprints[id] });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /内容已变化/);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/update').length, writes);
+    assert.equal(f.documents.get(id).description, '人工新修改');
+});
+
+test('只读安全模式允许批量读取，拒绝所有写入', async t => {
+    const f = await fixture(t, 'readonly');
+    assert.deepEqual((await f.read(['missing'])).missing_ids, ['missing']);
+    for (const [name, args] of [
+        ['apipost_smart_create', { method: 'GET', name: '不应创建', url: '/never' }],
+        ['apipost_update', { target_id: 'never', description: '不应修改' }],
+        ['apipost_delete', { api_ids: ['never'] }]
+    ]) {
+        assert.equal((await f.call(name, args)).isError, true);
+    }
+    assert.equal(f.requests.filter(r => /\/apis\/(create|update|delete)$/.test(r.path)).length, 0);
+});
+
+test('显式 null 和原生响应保真，非法载荷不写入', async t => {
+    const f = await fixture(t);
+    const id = await create(f, { bodyRaw: undefined });
+    assert.equal(JSON.parse(f.documents.get(id).request.body.raw).unanswered, null);
+    const native = structuredClone(f.documents.get(id).response.example);
+    let result = await f.call('apipost_update', { target_id: id, responses: JSON.stringify(native) });
+    assert.ok(!result.isError, result.content[0].text);
+    assert.deepEqual(f.documents.get(id).response.example, native);
+    const parameters = structuredClone(f.documents.get(id).request.body.raw_parameter);
+    result = await f.call('apipost_update', { target_id: id, bodyRaw: rawRequest });
+    assert.ok(!result.isError);
+    assert.deepEqual(f.documents.get(id).request.body.raw_parameter, parameters);
+    assert.equal(f.documents.get(id).request.body.raw, rawRequest);
+    for (const args of [{ body: 'invalid' }, { body: '{}' }, { bodyRaw: 'invalid' },
+        { body: JSON.stringify([{ key: 'x', desc: '说明', required: 'false' }]) },
+        { responses: JSON.stringify([responses[0], native[0]]) }]) {
+        const count = f.requests.filter(r => r.path === '/open/apis/update').length;
+        result = await f.call('apipost_update', { target_id: id, ...args });
+        assert.equal(result.isError, true);
+        assert.equal(f.requests.filter(r => r.path === '/open/apis/update').length, count);
+    }
+    for (const data of [null, false, 0, '']) {
+        result = await f.call('apipost_update', { target_id: id, responses: JSON.stringify([{ ...responses[0], data }]) });
+        assert.ok(!result.isError);
+        // 字符串空值也必须作为 JSON 字符串保存。
+        assert.equal(JSON.parse(f.documents.get(id).response.example[0].raw), data);
+    }
+    result = await f.call('apipost_update', { target_id: id, body: '[]', responses: '[]' });
+    assert.ok(!result.isError);
+    assert.equal(f.documents.get(id).request.body.mode, 'none');
+    assert.deepEqual(f.documents.get(id).response.example, []);
+});

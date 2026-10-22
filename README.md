@@ -109,8 +109,9 @@ npm install && npm run build
 | `apipost_create_folder` | 创建目录 | `name`, `parent_id` |
 | `apipost_smart_create` | 创建接口 | `method`, `url`, `name` |
 | `apipost_list` | 强化列表搜索 | `search`, `parent_id`, `target_type`, `show_structure`, `recursive`, `group_by_folder` |
-| `apipost_detail` | 查看详情 | `target_id` |
-| `apipost_update` | 修改接口 | `target_id`, 其他可选 |
+| `apipost_details` | 批量完整详情及内容指纹 | `target_ids`（1～100个） |
+| `apipost_detail` | 单接口详情，默认摘要 | `target_id`, `format: "json"` 获取完整内容 |
+| `apipost_update` | 增量修改接口 | `target_id`, `expected_fingerprint`, 其他可选 |
 | `apipost_delete` | 删除接口 | `api_ids` |
 
 ### apipost_test_connection 说明
@@ -185,24 +186,43 @@ apipost_create_folder name: "认证接口" parent_id: "folder_123" description: 
 ### apipost_smart_create 说明（字段列表驱动）
 
 规则（强制）：
-- `responses` 只传 `fields`，不要传 `data`；所有字段（含父级）必须带 `desc`。
+- 字段定义负责说明，真实示例独立传入：`responses` 使用 `fields` + 完整真实 `data`，也支持完整原生 `raw`、`expect.mock`、`expect.schema` 透传。同一组不混用两种格式；字段（含父级）填写 `desc`。
 - headers/query/body/cookies 用字段列表字符串，嵌套用 `.`，数组用 `[]`（如 `meta.flags.debug`、`items[].id`），example 填真实值，不要放 JSON 字符串。
 - 父级需显式声明并写 `desc`，示例：`{"key":"data","type":"object","desc":"返回体"},{"key":"data.user","type":"object","desc":"用户"},{"key":"data.user.id","type":"integer","example":1,"desc":"用户ID"}`。
+- `required` 为 boolean，true/false 对应 ApiPost `not_null=1/-1`；未指定默认为选填。显式 null、false、0 和空字符串保留原值。
+- `bodyRaw` 直接接收完整真实 JSON 请求字符串，不从参数表字符串 value 重建请求。更新只传 body 字段说明时保留已有 JSON 原文，只传 bodyRaw 时保留字段说明；明确 `body:"[]"` 且不传 bodyRaw 会清空请求体。
+- 响应字段可用 `schema` 指定可空类型、数组元素及枚举，或用整个响应的 `schema` 描述复杂结构。
 - 可选 `APIPOST_INLINE_COMMENTS=true` 时，raw 会按 `desc` 生成行内注释（mock 始终为纯 JSON）。
 - 可选 `APIPOST_URL_PREFIX={{ajllxa}}` 时，创建或更新接口时会将前缀自动拼接到 URL（避免手动重复填写路由常量）。
 
 必填：`method`、`url`、`name`。其他字段（均为字符串化 JSON 数组/对象）：
 - headers/query/body/cookies：`[{"key":"X-Request-ID","type":"string","required":true,"example":"req-1","desc":"说明"}]`
-- responses：`[{"name":"成功","status":200,"fields":[{"key":"code","type":"integer","example":0,"desc":"状态码"},{"key":"data.items[].id","type":"string","example":"1","desc":"商品ID"}]}]`
+- bodyRaw：完整请求 JSON 字符串。
+- responses：`[{"name":"成功","status":200,"data":{"success":true},"fields":[{"key":"success","type":"boolean","desc":"是否成功"}]}]`
 - auth：`{"type":"bearer","bearer":{"key":"your_token"}}`
   
 字段类型：`string`/`integer`/`number`/`boolean`/`object`/`array`/`null`
 
-示例（嵌套）：
+示例（展示参数格式，业务值应取自实际请求及响应）：
 ```json
-"body": "[{\"key\":\"user.id\",\"type\":\"integer\",\"required\":true,\"example\":9001,\"desc\":\"用户ID\"},{\"key\":\"user.profile.tags[]\",\"type\":\"string\",\"example\":\"vip\",\"desc\":\"标签\"}]",
-"responses": "[{\"name\":\"成功\",\"status\":200,\"fields\":[{\"key\":\"code\",\"type\":\"integer\",\"example\":0,\"desc\":\"状态码\"},{\"key\":\"data.user.profile.tags[]\",\"type\":\"string\",\"example\":\"vip\",\"desc\":\"标签\"}]}]"
+{
+  "body": "[{\"key\":\"remark\",\"type\":\"string\",\"required\":false,\"desc\":\"备注，可为空\"}]",
+  "bodyRaw": "{\"remark\":null}",
+  "responses": "[{\"name\":\"成功\",\"status\":200,\"data\":{\"success\":true},\"fields\":[{\"key\":\"success\",\"type\":\"boolean\",\"desc\":\"是否成功\"}]}]"
+}
 ```
+
+### 完整回读与增量修改
+
+`apipost_details({target_ids:[...]})` 一次请求返回 `list`、`fingerprints`、`missing_ids`；请求原文、全部响应和 schema 均不截断。单接口可用 `apipost_detail({target_id,format:"json"})`，默认 text 仅为浏览摘要，不用于合并或完整示例验收。
+
+更新以完整回读为底合并本次字段组，携带 `expected_fingerprint: fingerprints[target_id]`。MCP 内部最新读取发现内容变化时不写入；该检查不保证内部读取到写入之间的原子性。未传字段组保留原值，传入字段组整体替换，非法 JSON 不转换为空数组写入。最终版本以写后完整回读为准。
+
+完整数据可在工具编排中程序比较，仅输出差异摘要，避免大型示例反复进入模型上下文。HTTP 耗时日志只记录方法、路径、状态和耗时，不记录凭据及请求响应正文。新工具需要客户端重新连接 MCP 后发现。
+
+### 本地验证
+
+运行 `npm test`，先构建，再通过真实 MCP stdio 协议连接本机模拟 ApiPost，覆盖完整批量回读、选填、示例保真、增量修改及指纹冲突；测试不读取个人配置或连接真实 ApiPost。
 
 ## 获取 Token
 
