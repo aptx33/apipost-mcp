@@ -335,6 +335,100 @@ test('验收发现截断、null或布尔变化及字段说明丢失', async t =>
     assert.ok(contractDifferences(actual, expected, { action: 'update', responses: '[]' }).includes('response[0].raw'), '无效JSON不能与合法JSON字符串判为相等');
 });
 
+const durationSchema = { type: ['number', 'null'], description: '预计时长，可空', minimum: 0, maximum: 1000 };
+function numberBodyItem(key, fullParent = true) {
+    return batchItem(key, {
+        body: JSON.stringify([
+            { key: 'snapshot', type: 'object', desc: '训练快照', required: false,
+                schema: fullParent ? { type: ['object', 'null'], properties: { duration: durationSchema } } : { type: 'object' } },
+            { key: 'snapshot.duration', type: 'number', desc: '预计时长，可空', required: false, schema: durationSchema }
+        ]), bodyRaw: JSON.stringify({ snapshot: { duration: 70 } })
+    });
+}
+function simplifyDuration(doc) {
+    doc.request.body.raw_parameter.find(p => p.key === 'snapshot.duration').schema = { type: 'number' };
+}
+
+test('数字参数行简化但父级完整契约保留时一次通过，再同步不写入', async t => {
+    const f = await fixture(t, 'limited', { corrupt: simplifyDuration });
+    const item = numberBodyItem('nullable-number');
+    let batch = parseResult(await f.call('apipost_sync_batch', { items: [item] }));
+    assert.equal(batch.success, true);
+    const id = batch.results[0].target_id;
+    assert.equal(batch.results[0].status, 'created');
+    const normalized = [{ path: 'request.body.snapshot.duration.schema', reason: 'body_number_schema_simplified',
+        authoritativeSchemaPath: 'request.body.snapshot.schema',
+        message: '数字参数行被平台简化；匹配的父级完整对象schema保留了可空性及全部约束' }];
+    assert.deepEqual(batch.results[0].normalizations, normalized);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/create').length, 1);
+    let docs = await f.read([id]);
+    const update = { ...item, action: 'update', target_id: id, expected_fingerprint: docs.fingerprints[id] };
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [update] }));
+    assert.equal(batch.results[0].status, 'unchanged');
+    assert.deepEqual(batch.results[0].normalizations, normalized);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/update').length, 0);
+    batch = parseResult(await f.call('apipost_sync_batch', { items: [{ ...update, description: '仅修改接口说明' }] }));
+    assert.equal(batch.results[0].status, 'updated');
+    assert.deepEqual(batch.results[0].normalizations, normalized);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/update').length, 1);
+    docs = await f.read([id]);
+    const doc = docs.list[0];
+    assert.deepEqual(doc.request.body.raw_parameter[0].schema.properties.duration, durationSchema);
+    assert.deepEqual(JSON.parse(doc.request.body.raw), { snapshot: { duration: 70 } });
+    assert.ok(Array.isArray(contractDifferences(doc, doc, update)), '原导出接口仍返回差异数组');
+});
+
+test('缺少父级完整schema不能把数字简化当作验收成功', async t => {
+    const f = await fixture(t, 'limited', { corrupt: simplifyDuration });
+    const batch = parseResult(await f.call('apipost_sync_batch', { items: [numberBodyItem('no-parent-schema', false)] }));
+    assert.equal(batch.success, false);
+    assert.equal(batch.results[0].status, 'unverified');
+    assert.deepEqual(batch.results[0].normalizations, []);
+    assert.ok(batch.results[0].differences.includes('request.body.snapshot.duration.schema'));
+    assert.match(batch.results[0].error, /缺少契约一致的父级完整对象schema/);
+    assert.equal(f.requests.filter(r => r.path === '/open/apis/create').length, 1, '工具不自动重试');
+});
+
+test('数字简化不得掩盖父级约束、字段属性、请求或响应变化', async t => {
+    const cases = [
+        ['父级缺失', doc => { doc.request.body.raw_parameter.shift(); }, 'request.body.keys'],
+        ['可空性丢失', doc => { doc.request.body.raw_parameter[0].schema.properties.duration.type = 'number'; }, 'request.body.snapshot.schema'],
+        ['约束丢失', doc => { delete doc.request.body.raw_parameter[0].schema.properties.duration.minimum; }, 'request.body.snapshot.schema'],
+        ['字段类型变化', doc => { doc.request.body.raw_parameter[1].field_type = 'integer'; }, 'request.body.snapshot.duration.field_type'],
+        ['说明丢失', doc => { doc.request.body.raw_parameter[1].description = ''; }, 'request.body.snapshot.duration.description'],
+        ['必填变化', doc => { doc.request.body.raw_parameter[1].not_null = 1; }, 'request.body.snapshot.duration.required'],
+        ['请求原值变化', doc => { doc.request.body.raw = JSON.stringify({ snapshot: { duration: null } }); }, 'request.body.raw'],
+        ['响应原值变化', doc => { doc.response.example[0].raw = JSON.stringify({ success: false }); }, 'response[0].raw']
+    ];
+    for (const [name, corrupt, expectedPath] of cases) {
+        await t.test(name, async t => {
+            const f = await fixture(t, 'limited', { corrupt: doc => { simplifyDuration(doc); corrupt(doc); } });
+            const batch = parseResult(await f.call('apipost_sync_batch', { items: [numberBodyItem('strict-number')] }));
+            assert.equal(batch.success, false);
+            assert.equal(batch.results[0].status, 'unverified');
+            assert.ok(batch.results[0].differences.includes(expectedPath));
+            if (name !== '请求原值变化' && name !== '响应原值变化') assert.deepEqual(batch.results[0].normalizations, []);
+        });
+    }
+});
+
+test('数值例外不扩展到Query或响应schema', async t => {
+    const f = await fixture(t);
+    const id = await create(f);
+    const doc = (await f.read([id])).list[0];
+    const expected = structuredClone(doc), actual = structuredClone(doc);
+    expected.request.query.parameter = [
+        { key: 'snapshot', field_type: 'object', schema: { type: 'object', properties: { duration: durationSchema } } },
+        { key: 'snapshot.duration', field_type: 'number', schema: durationSchema }
+    ];
+    actual.request.query = structuredClone(expected.request.query);
+    actual.request.query.parameter[1].schema = { type: 'number' };
+    assert.ok(contractDifferences(actual, expected, { action: 'update', query: '[]' }).includes('request.query.snapshot.duration.schema'));
+    expected.response.example[0].expect.schema = durationSchema;
+    actual.response.example[0].expect.schema = { type: 'number' };
+    assert.ok(contractDifferences(actual, expected, { action: 'update', responses: '[]' }).includes('response[0].expect.schema'));
+});
+
 test('测速成功及局部失败均仅清理本批对象，原接口保持不变', async t => {
     for (const fail of [false, true]) {
         const f = await fixture(t, 'full', { write: doc => fail && doc.url?.includes('__apipost_benchmark') && doc.url.endsWith('/1') ? 'reject' : undefined });

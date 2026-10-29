@@ -1,6 +1,8 @@
 // @ts-nocheck
 import { performance } from 'node:perf_hooks';
 
+type SchemaNormalization = { path: string; reason: string; authoritativeSchemaPath: string; message: string };
+
 export function normalizedRoute(method, url) {
     const path = String(url).replace(/^[a-z][\w+.-]*:\/\/[^/]+/i, '').split('?')[0]
         .replace(/\/+/g, '/').replace(/\/$/, '').replace(/\{([^}]+)\}/g, ':$1');
@@ -18,10 +20,32 @@ function jsonValue(value) {
 }
 function wireValue(value) { return typeof value === 'string' ? value : JSON.stringify(value); }
 
-// 仅比较调用方明确提交的契约，忽略版本和自动生成的参数 ID。
-export function contractDifferences(actual, expected, item) {
-    if (!actual) return ['target'];
-    const differences = [];
+function nullableNumberSchema(schema) {
+    return Array.isArray(schema?.type) && same([...schema.type].sort(), ['null', 'number']);
+}
+
+// 参数行可能被简化；只有完整父级 schema 原样保留同一字段契约时才可认定等价。
+function numberSchemaParent(found, field, received, wanted) {
+    if (field.field_type !== 'number' || found.field_type !== field.field_type
+        || found.description !== field.description || (Number(found.not_null) === 1) !== (Number(field.not_null) === 1)
+        || !same(found.schema, { type: 'number' }) || !nullableNumberSchema(field.schema)) return;
+    for (const parent of wanted) {
+        if (parent.field_type !== 'object' || !field.key.startsWith(`${parent.key}.`)) continue;
+        const actualParent = received.find(p => p.key === parent.key);
+        if (!actualParent || !same(actualParent.schema, parent.schema)) continue;
+        let schema = actualParent.schema;
+        for (const segment of field.key.slice(parent.key.length + 1).split('.')) {
+            const part = /^([^\[\]]+)(\[\])?$/.exec(segment);
+            schema = part ? schema?.properties?.[part[1]] : undefined;
+            if (part?.[2]) schema = schema?.items;
+        }
+        if (same(schema, field.schema)) return parent.key;
+    }
+}
+
+function compareContract(actual, expected, item) {
+    const differences = [], normalizations = [], normalizationErrors = [];
+    if (!actual) return { differences: ['target'], normalizations, normalizationErrors };
     const compare = (path, a, b) => { if (!same(a, b)) differences.push(path); };
     for (const key of ['name', 'method', 'url', 'description']) {
         if (item.action === 'create' || Object.hasOwn(item, key)) compare(key, actual[key], expected[key]);
@@ -35,7 +59,23 @@ export function contractDifferences(actual, expected, item) {
         for (const field of wanted) {
             const found = received.find(p => p.key === field.key);
             if (!found) continue;
-            for (const key of ['description', 'field_type', 'schema']) compare(`request.${section}.${field.key}.${key}`, found[key], field[key]);
+            for (const key of ['description', 'field_type']) compare(`request.${section}.${field.key}.${key}`, found[key], field[key]);
+            const schemaPath = `request.${section}.${field.key}.schema`;
+            if (!same(found.schema, field.schema)) {
+                const parent = input === 'body' ? numberSchemaParent(found, field, received, wanted) : undefined;
+                if (parent) {
+                    normalizations.push({ path: schemaPath, reason: 'body_number_schema_simplified',
+                        authoritativeSchemaPath: `request.body.${parent}.schema`,
+                        message: '数字参数行被平台简化；匹配的父级完整对象schema保留了可空性及全部约束' });
+                } else {
+                    differences.push(schemaPath);
+                    if (input === 'body' && field.field_type === 'number' && found.field_type === field.field_type
+                        && found.description === field.description && (Number(found.not_null) === 1) === (Number(field.not_null) === 1)
+                        && same(found.schema, { type: 'number' }) && nullableNumberSchema(field.schema)) {
+                        normalizationErrors.push(`${schemaPath}：参数行被简化，但缺少契约一致的父级完整对象schema，不能确认可空性及约束已保留`);
+                    }
+                }
+            }
             compare(`request.${section}.${field.key}.required`, Number(found.not_null) === 1, Number(field.not_null) === 1);
             if (input !== 'body') compare(`request.${section}.${field.key}.value`, wireValue(found.value), wireValue(field.value));
         }
@@ -58,7 +98,12 @@ export function contractDifferences(actual, expected, item) {
             for (const key of ['schema', 'name', 'code', 'content_type']) compare(`response[${i}].expect.${key}`, received[i].expect?.[key], response.expect?.[key]);
         });
     }
-    return differences;
+    return { differences, normalizations, normalizationErrors };
+}
+
+// 保持原导出接口：仅返回差异路径，不暴露批量验收的内部结果类型。
+export function contractDifferences(actual, expected, item): any[] {
+    return compareContract(actual, expected, item).differences;
 }
 
 const inputKeys = new Set(['key', 'action', 'target_id', 'expected_fingerprint', 'method', 'url', 'name', 'parent_id',
@@ -90,7 +135,8 @@ export async function syncBatch(items, io) {
         io.prepare(item, undefined);
     }
     const projectList = await io.list();
-    const results = items.map(item => ({ key: item.key, action: item.action, target_id: item.target_id, status: 'unverified', differences: [] }));
+    const results = items.map(item => ({ key: item.key, action: item.action, target_id: item.target_id,
+        status: 'unverified', differences: [], normalizations: [] as SchemaNormalization[] }));
     const expected = new Map(), attempted = new Set();
     const routeCounts = new Map();
     for (const item of items.filter(i => i.action === 'create')) {
@@ -118,8 +164,12 @@ export async function syncBatch(items, io) {
             }
             const template = io.prepare(item, original);
             expected.set(i, template);
-            if (original && !contractDifferences(original, template, item).length) {
-                result.status = 'unchanged'; result.version = original.version; continue;
+            if (original) {
+                const comparison = compareContract(original, template, item);
+                if (!comparison.differences.length) {
+                    result.normalizations = comparison.normalizations;
+                    result.status = 'unchanged'; result.version = original.version; continue;
+                }
             }
             attempted.add(i);
             // 请求发出前登记 ID，网络结果不明时仍可回读定位。
@@ -151,7 +201,10 @@ export async function syncBatch(items, io) {
             const docs = await io.details([...attempted].map(i => results[i].target_id));
             for (const i of attempted) {
                 const result = results[i], doc = docs.find(d => d.target_id === result.target_id);
-                result.differences = contractDifferences(doc, expected.get(i), items[i]);
+                const comparison = compareContract(doc, expected.get(i), items[i]);
+                result.differences = comparison.differences;
+                result.normalizations = comparison.normalizations;
+                if (comparison.normalizationErrors.length) result.error ||= comparison.normalizationErrors.join('；');
                 if (doc) result.version = doc.version;
                 if (!result.differences.length) { result.status = items[i].action === 'create' ? 'created' : 'updated'; delete result.error; }
             }

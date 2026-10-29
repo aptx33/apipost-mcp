@@ -1251,7 +1251,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'apipost_sync_batch',
-            description: '整批预检后顺序新增或更新，新增统一按method+path查重，更新须有已合并字段组和expected_fingerprint；无变化跳过。最后一次完整回读自动验收，返回逐项结果、差异路径及耗时，不返回大型示例。不删除或移动对象，不自动重试结果不明的写入。',
+            description: '整批预检后顺序新增或更新，新增按method+path查重，更新须有已合并字段组和expected_fingerprint；无变化跳过。完整回读验收后返回状态、differences、normalizations及耗时。仅Body数字参数行被简化且父级完整对象schema保留相同契约时条件等价通过，并给出normalizations说明；其他差异仍未验收。成功或无变化时无需重复写入。不删除或移动对象，不自动重试结果不明的写入。',
             inputSchema: {
                 type: 'object',
                 properties: {
